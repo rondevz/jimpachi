@@ -15,6 +15,7 @@ type Adapter interface {
 	Sources(context.Context) ([]Source, error)
 	Activity(context.Context, Source) (float64, error)
 	Start(context.Context, Source, string) (Capture, error)
+	Playable(context.Context, string) (bool, error)
 }
 
 // Capture is a running system-output capture that can be stopped cleanly.

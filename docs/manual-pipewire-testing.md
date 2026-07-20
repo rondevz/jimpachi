@@ -41,6 +41,13 @@ XDG_DATA_HOME="$(mktemp -d)" go run .
 5. Press `e`, change the title, press `enter`, quit, and relaunch with the same data directory. Confirm the title remains changed in Recording history.
 6. Start another capture and quit with `q`; confirm neither `pw-cat`/`parec` nor `ffmpeg` remains running afterward.
 
+## Recording Limit And Recovery
+
+1. Confirm the initial screen shows a 60-minute Recording limit. Press `[` and `]` to adjust it, quit, and restart with the same data directory; confirm the selected limit remains.
+2. Set a short limit suitable for manual testing and start a capture with audible system audio. Confirm Jimpachi warns five minutes before the limit and stops only its capture at the limit while the call or other system audio continues.
+3. Press `l` to disable the limit, start a capture past the prior limit, and confirm it remains active until `s` is pressed. Press `l` again to restore the 60-minute limit.
+4. Start a capture with audible audio, forcefully terminate Jimpachi without using `q`, then restart it with the same data directory. Confirm a decodable `.partial.opus` file is recovered into history and visibly marked as an interrupted capture.
+
 ## Expected Results
 
 - Source discovery returns promptly when PipeWire is unavailable; Jimpachi must not appear hung.
@@ -50,4 +57,4 @@ XDG_DATA_HOME="$(mktemp -d)" go run .
 
 ## Not Covered Here
 
-This checklist does not cover recording-limit recovery, Transcription, or Summaries.
+This checklist does not cover Transcription or Summaries.

@@ -20,13 +20,15 @@ type Recording struct {
 	Duration         time.Duration
 	AudioPath        string
 	PendingPromotion bool
+	Interrupted      bool
 	AudioMissing     bool
 }
 
 // SQLite persists Recording history in a local SQLite database.
 type SQLite struct {
-	db      *sql.DB
-	dataDir string
+	db              *sql.DB
+	dataDir         string
+	recoveryWarning string
 }
 
 // OpenSQLite opens the Recording-history database in dataDir.
@@ -45,11 +47,6 @@ func OpenSQLite(ctx context.Context, dataDir string) (*SQLite, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := store.ReconcileAudio(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
 	return store, nil
 }
 
@@ -68,7 +65,8 @@ func (s *SQLite) initialize(ctx context.Context) error {
 			started_at_unix_ns INTEGER NOT NULL,
 			duration_ns INTEGER NOT NULL,
 			audio_path TEXT NOT NULL,
-			pending_promotion INTEGER NOT NULL DEFAULT 0
+			pending_promotion INTEGER NOT NULL DEFAULT 0,
+			interrupted INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS recordings_started_at_idx
 			ON recordings (started_at_unix_ns DESC);
@@ -82,6 +80,9 @@ func (s *SQLite) initialize(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN pending_promotion INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("add Recording promotion state: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add Recording interruption state: %w", err)
 	}
 
 	return nil
@@ -146,15 +147,16 @@ func (s *SQLite) SaveSettings(ctx context.Context, settings map[string]string) e
 // Save adds or updates a Recording in local history.
 func (s *SQLite) Save(ctx context.Context, recording Recording) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO recordings (id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO recordings (id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
 			started_at_unix_ns = excluded.started_at_unix_ns,
 			duration_ns = excluded.duration_ns,
 			audio_path = excluded.audio_path,
-			pending_promotion = excluded.pending_promotion
-	`, recording.ID, recording.Title, recording.StartedAt.UnixNano(), recording.Duration.Nanoseconds(), recording.AudioPath, recording.PendingPromotion)
+			pending_promotion = excluded.pending_promotion,
+			interrupted = excluded.interrupted
+	`, recording.ID, recording.Title, recording.StartedAt.UnixNano(), recording.Duration.Nanoseconds(), recording.AudioPath, recording.PendingPromotion, recording.Interrupted)
 	if err != nil {
 		return fmt.Errorf("save Recording %q: %w", recording.ID, err)
 	}
@@ -186,10 +188,16 @@ func (s *SQLite) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// ReconcileAudio removes metadata left by an interrupted promotion before a
-// final Recording audio file could be made durable.
-func (s *SQLite) ReconcileAudio(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, audio_path, pending_promotion FROM recordings WHERE pending_promotion = 1`)
+// ReconcileAudio promotes playable staged audio after an interrupted process.
+func (s *SQLite) ReconcileAudio(ctx context.Context, playable ...func(string) (bool, error)) error {
+	checkPlayable := func(path string) (bool, error) {
+		info, err := os.Stat(path)
+		return err == nil && info.Size() > 0, err
+	}
+	if len(playable) > 0 {
+		checkPlayable = playable[0]
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, audio_path, interrupted FROM recordings WHERE pending_promotion = 1`)
 	if err != nil {
 		return fmt.Errorf("list Recordings for audio reconciliation: %w", err)
 	}
@@ -197,13 +205,25 @@ func (s *SQLite) ReconcileAudio(ctx context.Context) error {
 	var completed []string
 	for rows.Next() {
 		var id, path string
-		var pending bool
-		if err := rows.Scan(&id, &path, &pending); err != nil {
+		var interrupted bool
+		if err := rows.Scan(&id, &path, &interrupted); err != nil {
 			return fmt.Errorf("read Recording for audio reconciliation: %w", err)
 		}
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			stagedPath := strings.TrimSuffix(path, ".opus") + ".partial.opus"
 			if _, stagedErr := os.Stat(stagedPath); stagedErr == nil {
+				isPlayable, err := checkPlayable(stagedPath)
+				if err != nil {
+					// Keep both artifacts so a later start can retry when ffprobe is available.
+					s.recoveryWarning = fmt.Sprintf("Could not verify interrupted Recording %q; it will be retried next start: %v", id, err)
+					continue
+				}
+				if !isPlayable {
+					missing = append(missing, id)
+					continue
+				}
+				// A staged file survives only when a decoder can read it; its row was
+				// deliberately marked interrupted before capture began for crash recovery.
 				if err := os.Rename(stagedPath, path); err != nil {
 					return fmt.Errorf("promote staged Recording audio %q: %w", stagedPath, err)
 				}
@@ -238,6 +258,9 @@ func (s *SQLite) ReconcileAudio(ctx context.Context) error {
 	return nil
 }
 
+// RecoveryWarning reports a nonfatal interrupted-Recording recovery condition.
+func (s *SQLite) RecoveryWarning() string { return s.recoveryWarning }
+
 func (s *SQLite) completePromotion(ctx context.Context, id string) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE recordings SET pending_promotion = 0 WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("complete Recording promotion %q: %w", id, err)
@@ -248,7 +271,7 @@ func (s *SQLite) completePromotion(ctx context.Context, id string) error {
 // History returns Recordings ordered from newest to oldest.
 func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion
+		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted
 		FROM recordings
 		ORDER BY started_at_unix_ns DESC, id DESC
 	`)
@@ -261,7 +284,7 @@ func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	for rows.Next() {
 		var recording Recording
 		var startedAt, duration int64
-		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion); err != nil {
+		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion, &recording.Interrupted); err != nil {
 			return nil, fmt.Errorf("read Recording history: %w", err)
 		}
 

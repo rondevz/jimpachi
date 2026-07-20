@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,30 +17,57 @@ import (
 
 // Workflow coordinates Jimpachi behavior for the terminal UI.
 type Workflow struct {
-	history *recording.SQLite
-	audio   audio.Adapter
+	history   *recording.SQLite
+	audio     audio.Adapter
+	scheduler Scheduler
 
 	audioSourceMu            sync.Mutex
 	latestAudioSourceVersion uint64
 	recordingMu              sync.Mutex
 	activeRecording          *activeRecording
 	captureFailure           error
+	captureCompleted         *recording.Recording
+	recoveryWarning          string
+	limitStopTimeout         time.Duration
 }
 
 type activeRecording struct {
-	recording recording.Recording
-	source    audio.Source
-	capture   audio.Capture
-	temporary string
-	stopping  bool
-	stopped   bool
-	promoted  bool
+	recording       recording.Recording
+	source          audio.Source
+	capture         audio.Capture
+	temporary       string
+	stopping        bool
+	stopped         bool
+	promoted        bool
+	limitReached    bool
+	warned          bool
+	warning         Timer
+	warningDuration time.Duration
+	limit           Timer
 }
 
 // CaptureState reports the active Recording and its latest terminal failure.
 type CaptureState struct {
-	Active  *ActiveRecording
-	Failure string
+	Active    *ActiveRecording
+	Failure   string
+	Warning   string
+	Completed *recording.Recording
+}
+
+// Scheduler supplies workflow time and can be faked to test Recording limits.
+type Scheduler interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) Timer
+}
+
+// Timer cancels a scheduled workflow action.
+type Timer interface{ Stop() bool }
+
+type realScheduler struct{}
+
+func (realScheduler) Now() time.Time { return time.Now() }
+func (realScheduler) AfterFunc(after time.Duration, action func()) Timer {
+	return time.AfterFunc(after, action)
 }
 
 const recordingResponsibilityReminder = "Record system output only when everyone involved knows and agrees. You are responsible for complying with applicable laws and policies."
@@ -53,12 +81,21 @@ func Open(ctx context.Context, dataDir string) (*Workflow, error) {
 
 // OpenWithAudio creates a workflow using an operating-system audio adapter.
 func OpenWithAudio(ctx context.Context, dataDir string, adapter audio.Adapter) (*Workflow, error) {
+	return OpenWithAudioAndScheduler(ctx, dataDir, adapter, realScheduler{})
+}
+
+// OpenWithAudioAndScheduler creates a workflow with a controllable time seam.
+func OpenWithAudioAndScheduler(ctx context.Context, dataDir string, adapter audio.Adapter, scheduler Scheduler) (*Workflow, error) {
 	history, err := recording.OpenSQLite(ctx, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open application workflow: %w", err)
 	}
 
-	return &Workflow{history: history, audio: adapter}, nil
+	if err := history.ReconcileAudio(ctx, func(path string) (bool, error) { return adapter.Playable(ctx, path) }); err != nil {
+		_ = history.Close()
+		return nil, fmt.Errorf("recover interrupted Recordings: %w", err)
+	}
+	return &Workflow{history: history, audio: adapter, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second}, nil
 }
 
 // DataDir returns the XDG data directory for Jimpachi.
@@ -82,6 +119,7 @@ func DataDir() (string, error) {
 // Startup returns initial user-visible application state.
 func (w *Workflow) Startup(ctx context.Context) (Startup, error) {
 	startup := Startup{}
+	startup.RecoveryWarning = w.recoveryWarning
 	seen, ok, err := w.history.Setting(ctx, "recording_responsibility_reminder_seen")
 	if err != nil {
 		return Startup{}, fmt.Errorf("load recording-responsibility reminder state: %w", err)
@@ -98,7 +136,8 @@ func (w *Workflow) Startup(ctx context.Context) (Startup, error) {
 
 // Startup is the initial user-visible state of a Workflow.
 type Startup struct {
-	Reminder string
+	Reminder        string
+	RecoveryWarning string
 }
 
 // AudioState contains source choices and any discovery guidance for the UI.
@@ -203,6 +242,36 @@ type ActiveRecording struct {
 	Source    audio.Source
 }
 
+const defaultRecordingLimit = time.Hour
+const recordingLimitWarning = 5 * time.Minute
+
+// RecordingLimit returns the configured maximum duration, or zero when disabled.
+func (w *Workflow) RecordingLimit(ctx context.Context) (time.Duration, error) {
+	value, found, err := w.history.Setting(ctx, "recording_limit_minutes")
+	if err != nil {
+		return 0, fmt.Errorf("load Recording limit: %w", err)
+	}
+	if !found {
+		return defaultRecordingLimit, nil
+	}
+	minutes, err := strconv.Atoi(value)
+	if err != nil || minutes < 0 {
+		return 0, fmt.Errorf("load Recording limit: invalid value %q", value)
+	}
+	return time.Duration(minutes) * time.Minute, nil
+}
+
+// SetRecordingLimit persists a maximum Recording duration; zero disables it.
+func (w *Workflow) SetRecordingLimit(ctx context.Context, limit time.Duration) error {
+	if limit < 0 || limit%time.Minute != 0 {
+		return fmt.Errorf("set Recording limit: use a whole number of minutes or zero")
+	}
+	if err := w.history.SaveSetting(ctx, "recording_limit_minutes", strconv.FormatInt(int64(limit/time.Minute), 10)); err != nil {
+		return fmt.Errorf("save Recording limit: %w", err)
+	}
+	return nil
+}
+
 // StartRecording begins capture from the persisted Audio source.
 func (w *Workflow) StartRecording(ctx context.Context) (ActiveRecording, error) {
 	w.recordingMu.Lock()
@@ -217,7 +286,11 @@ func (w *Workflow) StartRecording(ctx context.Context) (ActiveRecording, error) 
 	if state.Selected.ID == "" {
 		return ActiveRecording{}, fmt.Errorf("start Recording: select an Audio source first")
 	}
-	startedAt := time.Now().UTC()
+	limit, err := w.RecordingLimit(ctx)
+	if err != nil {
+		return ActiveRecording{}, err
+	}
+	startedAt := w.scheduler.Now().UTC()
 	id, err := recordingID()
 	if err != nil {
 		return ActiveRecording{}, fmt.Errorf("start Recording: %w", err)
@@ -230,13 +303,29 @@ func (w *Workflow) StartRecording(ctx context.Context) (ActiveRecording, error) 
 	}
 	// Keep the .opus suffix on staged output so FFmpeg can infer its container.
 	temporary := strings.TrimSuffix(recording.AudioPath, ".opus") + ".partial.opus"
+	recording.PendingPromotion = true
+	recording.Interrupted = true
+	if err := w.history.Save(ctx, recording); err != nil {
+		return ActiveRecording{}, fmt.Errorf("save pending Recording: %w", err)
+	}
 	capture, err := w.audio.Start(ctx, state.Selected, temporary)
 	if err != nil {
+		_ = w.history.Delete(ctx, recording.ID)
+		_ = os.Remove(temporary)
 		return ActiveRecording{}, fmt.Errorf("start Recording capture: %w", err)
 	}
 	active := &activeRecording{recording: recording, source: state.Selected, capture: capture, temporary: temporary}
 	w.captureFailure = nil
+	w.captureCompleted = nil
 	w.activeRecording = active
+	if limit > 0 {
+		active.warningDuration = recordingLimitWarning
+		if limit <= recordingLimitWarning {
+			active.warningDuration = limit / 2
+		}
+		active.warning = w.scheduler.AfterFunc(limit-active.warningDuration, func() { w.warnRecording(active) })
+		active.limit = w.scheduler.AfterFunc(limit, func() { w.stopAtLimit(active) })
+	}
 	go w.watchCapture(active)
 	return ActiveRecording{ID: id, StartedAt: startedAt, Source: state.Selected}, nil
 }
@@ -254,7 +343,7 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 		return recording.Recording{}, fmt.Errorf("stop Recording: stop is already in progress")
 	}
 	active.stopping = true
-	stoppedAt := time.Now()
+	stoppedAt := w.scheduler.Now()
 	w.recordingMu.Unlock()
 	defer func() {
 		w.recordingMu.Lock()
@@ -264,14 +353,15 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 		w.recordingMu.Unlock()
 	}()
 	if !active.stopped {
-		if err := active.capture.Stop(ctx); err != nil {
+		stopTimer(active.warning)
+		stopTimer(active.limit)
+		if err := stopCapture(ctx, active.capture); err != nil {
 			w.recordingMu.Lock()
 			if w.activeRecording == active {
 				w.activeRecording = nil
 				w.captureFailure = err
 			}
 			w.recordingMu.Unlock()
-			_ = os.Remove(active.temporary)
 			return recording.Recording{}, fmt.Errorf("stop Recording capture: %w", err)
 		}
 		w.recordingMu.Lock()
@@ -280,6 +370,7 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 		}
 		w.recordingMu.Unlock()
 		active.recording.Duration = stoppedAt.Sub(active.recording.StartedAt)
+		active.recording.Interrupted = false
 	}
 	if !active.promoted {
 		active.recording.PendingPromotion = true
@@ -297,6 +388,9 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 	}
 	w.recordingMu.Lock()
 	w.activeRecording = nil
+	if active.limitReached {
+		w.captureCompleted = &active.recording
+	}
 	w.recordingMu.Unlock()
 	return active.recording, nil
 }
@@ -309,8 +403,15 @@ func (w *Workflow) CaptureState() CaptureState {
 	if w.activeRecording != nil {
 		state.Active = &ActiveRecording{ID: w.activeRecording.recording.ID, StartedAt: w.activeRecording.recording.StartedAt, Source: w.activeRecording.source}
 	}
+	if w.activeRecording != nil && w.activeRecording.warned {
+		state.Warning = fmt.Sprintf("Recording will stop in %s.", w.activeRecording.warningDuration)
+	}
 	if w.captureFailure != nil {
 		state.Failure = w.captureFailure.Error()
+	}
+	if w.captureCompleted != nil {
+		completed := *w.captureCompleted
+		state.Completed = &completed
 	}
 	return state
 }
@@ -319,11 +420,57 @@ func (w *Workflow) watchCapture(active *activeRecording) {
 	if err := active.capture.Wait(); err != nil {
 		w.recordingMu.Lock()
 		if w.activeRecording == active && !active.stopping {
+			stopTimer(active.warning)
+			stopTimer(active.limit)
 			w.activeRecording = nil
 			w.captureFailure = err
 		}
 		w.recordingMu.Unlock()
-		_ = os.Remove(active.temporary)
+	}
+}
+
+func (w *Workflow) warnRecording(active *activeRecording) {
+	w.recordingMu.Lock()
+	defer w.recordingMu.Unlock()
+	if w.activeRecording == active && !active.stopping {
+		active.warned = true
+	}
+}
+
+func (w *Workflow) stopAtLimit(active *activeRecording) {
+	w.recordingMu.Lock()
+	if w.activeRecording != active || active.stopping {
+		w.recordingMu.Unlock()
+		return
+	}
+	active.limitReached = true
+	w.recordingMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), w.limitStopTimeout)
+	defer cancel()
+	if _, err := w.StopRecording(ctx); err != nil {
+		w.recordingMu.Lock()
+		if w.activeRecording == active {
+			w.activeRecording = nil
+			w.captureFailure = err
+		}
+		w.recordingMu.Unlock()
+	}
+}
+
+func stopTimer(timer Timer) {
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func stopCapture(ctx context.Context, capture audio.Capture) error {
+	stopped := make(chan error, 1)
+	go func() { stopped <- capture.Stop(ctx) }()
+	select {
+	case err := <-stopped:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -362,6 +509,8 @@ func (w *Workflow) Close() error {
 			return nil
 		}
 		active.stopping = true
+		stopTimer(active.warning)
+		stopTimer(active.limit)
 		w.recordingMu.Unlock()
 		if err := active.capture.Stop(context.Background()); err != nil {
 			_ = os.Remove(active.temporary)

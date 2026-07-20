@@ -465,8 +465,8 @@ func TestWorkflowClearsUnexpectedCaptureFailureAndAllowsNextRecording(t *testing
 			time.Sleep(time.Millisecond)
 		}
 	}
-	if _, err := os.Stat(capture.path); !os.IsNotExist(err) {
-		t.Errorf("temporary audio %q remains after unexpected failure, stat error = %v", capture.path, err)
+	if _, err := os.Stat(capture.path); err != nil {
+		t.Errorf("temporary audio %q was not preserved after unexpected failure: %v", capture.path, err)
 	}
 	capture.waitErr = nil
 	if _, err := workflow.StartRecording(ctx); err != nil {
@@ -518,12 +518,295 @@ func TestWorkflowRecordingDurationExcludesCaptureDrainTime(t *testing.T) {
 	}
 }
 
-type fakeAudio struct {
-	sources  []audio.Source
-	err      error
-	activity float64
-	capture  *fakeCapture
+func TestWorkflowUsesAndPersistsDefaultRecordingLimit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	workflow, err := OpenWithAudio(ctx, dir, fakeAudio{})
+	if err != nil {
+		t.Fatalf("OpenWithAudio() error = %v", err)
+	}
+	limit, err := workflow.RecordingLimit(ctx)
+	if err != nil {
+		t.Fatalf("RecordingLimit() error = %v", err)
+	}
+	if limit != time.Hour {
+		t.Errorf("RecordingLimit() = %v, want 1h", limit)
+	}
+	if err := workflow.SetRecordingLimit(ctx, 25*time.Minute); err != nil {
+		t.Fatalf("SetRecordingLimit() error = %v", err)
+	}
+	if err := workflow.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	reopened, err := OpenWithAudio(ctx, dir, fakeAudio{})
+	if err != nil {
+		t.Fatalf("OpenWithAudio() after reopen error = %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if got, err := reopened.RecordingLimit(ctx); err != nil || got != 25*time.Minute {
+		t.Errorf("RecordingLimit() after reopen = %v, %v; want 25m, nil", got, err)
+	}
 }
+
+func TestWorkflowWarnsAndStopsRecordingAtConfiguredLimit(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeScheduler(time.Date(2026, time.July, 20, 10, 0, 0, 0, time.UTC))
+	capture := &fakeCapture{}
+	workflow, err := OpenWithAudioAndScheduler(ctx, t.TempDir(), fakeAudio{capture: capture}, clock)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndScheduler() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if err := workflow.SetRecordingLimit(ctx, 10*time.Minute); err != nil {
+		t.Fatalf("SetRecordingLimit() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+
+	clock.Advance(5 * time.Minute)
+	if state := workflow.CaptureState(); state.Warning == "" || state.Active == nil {
+		t.Errorf("CaptureState() at warning = %#v, want active Recording with warning", state)
+	}
+	clock.Advance(5 * time.Minute)
+	state := workflow.CaptureState()
+	if !capture.stopped {
+		t.Error("configured limit did not stop capture")
+	}
+	if state.Active != nil || state.Completed == nil {
+		t.Errorf("CaptureState() at limit = %#v, want completed Recording", state)
+	}
+	if state.Completed != nil && state.Completed.Duration != 10*time.Minute {
+		t.Errorf("automatic Recording duration = %v, want 10m", state.Completed.Duration)
+	}
+}
+
+func TestWorkflowPublishesAutomaticStopFinalizationFailureAndPreservesStagedAudio(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeScheduler(time.Now())
+	capture := &fakeCapture{}
+	workflow, err := OpenWithAudioAndScheduler(ctx, t.TempDir(), fakeAudio{capture: capture}, clock)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndScheduler() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if err := workflow.SetRecordingLimit(ctx, time.Minute); err != nil {
+		t.Fatalf("SetRecordingLimit() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	finalPath := strings.TrimSuffix(capture.path, ".partial.opus") + ".opus"
+	if err := os.Mkdir(finalPath, 0o700); err != nil {
+		t.Fatalf("create conflicting final path: %v", err)
+	}
+	clock.Advance(time.Minute)
+	state := workflow.CaptureState()
+	if state.Active != nil || !strings.Contains(state.Failure, "promote completed Recording audio") {
+		t.Errorf("CaptureState() = %#v, want terminal promotion failure", state)
+	}
+	if _, err := os.Stat(capture.path); err != nil {
+		t.Errorf("staged audio was not retained after automatic finalization failure: %v", err)
+	}
+}
+
+func TestWorkflowDisabledRecordingLimitDoesNotScheduleStop(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeScheduler(time.Now())
+	capture := &fakeCapture{}
+	workflow, err := OpenWithAudioAndScheduler(ctx, t.TempDir(), fakeAudio{capture: capture}, clock)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndScheduler() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if err := workflow.SetRecordingLimit(ctx, 0); err != nil {
+		t.Fatalf("SetRecordingLimit() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	clock.Advance(2 * time.Hour)
+	if state := workflow.CaptureState(); state.Active == nil || capture.stopped {
+		t.Errorf("CaptureState() with disabled limit = %#v; capture stopped = %t", state, capture.stopped)
+	}
+}
+
+func TestWorkflowRecoversPlayableInterruptedCaptureAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	finalPath := filepath.Join(dir, "recordings", "interrupted.opus")
+	partialPath := strings.TrimSuffix(finalPath, ".opus") + ".partial.opus"
+	if err := os.MkdirAll(filepath.Dir(partialPath), 0o700); err != nil {
+		t.Fatalf("create recordings directory: %v", err)
+	}
+	if err := os.WriteFile(partialPath, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create partial audio: %v", err)
+	}
+	if err := store.Save(ctx, recording.Recording{ID: "interrupted", Title: "Interrupted", StartedAt: time.Now(), AudioPath: finalPath, PendingPromotion: true, Interrupted: true}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	workflow, err := OpenWithAudio(ctx, dir, fakeAudio{playable: true})
+	if err != nil {
+		t.Fatalf("OpenWithAudio() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	history, err := workflow.History(ctx)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(history) != 1 || !history[0].Interrupted || history[0].AudioMissing {
+		t.Errorf("History() = %#v, want playable interrupted Recording", history)
+	}
+}
+
+func TestWorkflowPersistsPendingRecordingBeforeCaptureStartsAndRemovesItWhenStartFails(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	observedPending := false
+	partialPath := ""
+	adapter := fakeAudio{startErr: errors.New("FFmpeg unavailable"), onStart: func(path string) {
+		partialPath = path
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Errorf("create staged audio directory: %v", err)
+		} else if err := os.WriteFile(path, []byte("partial"), 0o600); err != nil {
+			t.Errorf("create staged audio: %v", err)
+		}
+		store, err := recording.OpenSQLite(ctx, dir)
+		if err != nil {
+			t.Errorf("OpenSQLite() while starting capture error = %v", err)
+			return
+		}
+		defer store.Close()
+		history, err := store.History(ctx)
+		if err != nil {
+			t.Errorf("History() while starting capture error = %v", err)
+			return
+		}
+		observedPending = len(history) == 1 && history[0].PendingPromotion && history[0].Interrupted && history[0].AudioPath == strings.TrimSuffix(path, ".partial.opus")+".opus"
+	}}
+	workflow, err := OpenWithAudio(ctx, dir, adapter)
+	if err != nil {
+		t.Fatalf("OpenWithAudio() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err == nil {
+		t.Fatal("StartRecording() error = nil, want capture start failure")
+	}
+	if !observedPending {
+		t.Error("capture started before its pending Recording was persisted")
+	}
+	history, err := workflow.History(ctx)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(history) != 0 {
+		t.Errorf("History() = %#v, want failed start removed", history)
+	}
+	if _, err := os.Stat(partialPath); !os.IsNotExist(err) {
+		t.Errorf("staged audio remained after failed start: %v", err)
+	}
+}
+
+func TestWorkflowReportsTimedOutAutomaticStopWithoutStuckCapture(t *testing.T) {
+	ctx := context.Background()
+	clock := newFakeScheduler(time.Now())
+	capture := &fakeCapture{stopForever: make(chan struct{})}
+	workflow, err := OpenWithAudioAndScheduler(ctx, t.TempDir(), fakeAudio{capture: capture}, clock)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndScheduler() error = %v", err)
+	}
+	workflow.limitStopTimeout = time.Millisecond
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if err := workflow.SetRecordingLimit(ctx, time.Minute); err != nil {
+		t.Fatalf("SetRecordingLimit() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	clock.Advance(time.Minute)
+	state := workflow.CaptureState()
+	if state.Active != nil || state.Failure == "" || !strings.Contains(state.Failure, "deadline exceeded") {
+		t.Errorf("CaptureState() after stalled automatic stop = %#v, want terminal timeout", state)
+	}
+	if _, err := os.Stat(capture.path); err != nil {
+		t.Errorf("staged audio was not preserved after timed out stop: %v", err)
+	}
+}
+
+func TestWorkflowRetainsInterruptedRecordingWhenRecoveryProbeFails(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	finalPath := filepath.Join(dir, "recordings", "unprobed.opus")
+	partialPath := strings.TrimSuffix(finalPath, ".opus") + ".partial.opus"
+	if err := os.MkdirAll(filepath.Dir(partialPath), 0o700); err != nil {
+		t.Fatalf("create recordings directory: %v", err)
+	}
+	if err := os.WriteFile(partialPath, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create partial audio: %v", err)
+	}
+	if err := store.Save(ctx, recording.Recording{ID: "unprobed", Title: "Unprobed", StartedAt: time.Now(), AudioPath: finalPath, PendingPromotion: true, Interrupted: true}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	workflow, err := OpenWithAudio(ctx, dir, fakeAudio{playableErr: errors.New("ffprobe unavailable")})
+	if err != nil {
+		t.Fatalf("OpenWithAudio() error = %v, want recovery failure not to block startup", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	startup, err := workflow.Startup(ctx)
+	if err != nil || startup.RecoveryWarning == "" {
+		t.Errorf("Startup() = %#v, %v; want recovery warning", startup, err)
+	}
+	history, err := workflow.History(ctx)
+	if err != nil || len(history) != 1 || !history[0].PendingPromotion {
+		t.Errorf("History() = %#v, %v; want retained pending Recording", history, err)
+	}
+	if _, err := os.Stat(partialPath); err != nil {
+		t.Errorf("partial audio was not retained: %v", err)
+	}
+}
+
+type fakeAudio struct {
+	sources     []audio.Source
+	err         error
+	activity    float64
+	capture     *fakeCapture
+	playable    bool
+	playableErr error
+	startErr    error
+	onStart     func(string)
+}
+
+func (f fakeAudio) Playable(context.Context, string) (bool, error) { return f.playable, f.playableErr }
 
 func (f fakeAudio) Sources(context.Context) ([]audio.Source, error) {
 	return f.sources, f.err
@@ -534,6 +817,12 @@ func (f fakeAudio) Activity(context.Context, audio.Source) (float64, error) {
 }
 
 func (f fakeAudio) Start(_ context.Context, source audio.Source, path string) (audio.Capture, error) {
+	if f.onStart != nil {
+		f.onStart(path)
+	}
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -549,18 +838,66 @@ func (f fakeAudio) Start(_ context.Context, source audio.Source, path string) (a
 }
 
 type fakeCapture struct {
-	source           audio.Source
-	stopped          bool
-	path             string
-	stopErr          error
-	waitErr          error
-	waitUntilStopped bool
-	done             chan struct{}
-	stopDelay        time.Duration
+	source               audio.Source
+	stopped              bool
+	path                 string
+	stopErr              error
+	waitErr              error
+	waitUntilStopped     bool
+	done                 chan struct{}
+	stopDelay            time.Duration
+	stopUntilContextDone bool
+	stopForever          <-chan struct{}
 }
 
-func (c *fakeCapture) Stop(context.Context) error {
+type fakeScheduler struct {
+	now    time.Time
+	timers []*fakeTimer
+}
+
+type fakeTimer struct {
+	at      time.Time
+	action  func()
+	stopped bool
+}
+
+func newFakeScheduler(now time.Time) *fakeScheduler { return &fakeScheduler{now: now} }
+
+func (s *fakeScheduler) Now() time.Time { return s.now }
+
+func (s *fakeScheduler) AfterFunc(after time.Duration, action func()) Timer {
+	timer := &fakeTimer{at: s.now.Add(after), action: action}
+	s.timers = append(s.timers, timer)
+	return timer
+}
+
+func (s *fakeScheduler) Advance(after time.Duration) {
+	s.now = s.now.Add(after)
+	for _, timer := range s.timers {
+		if !timer.stopped && !timer.at.After(s.now) {
+			timer.stopped = true
+			timer.action()
+		}
+	}
+}
+
+func (t *fakeTimer) Stop() bool {
+	if t.stopped {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (c *fakeCapture) Stop(ctx context.Context) error {
 	c.stopped = true
+	if c.stopForever != nil {
+		<-c.stopForever
+	}
+	if c.stopUntilContextDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	time.Sleep(c.stopDelay)
 	if c.done != nil {
 		close(c.done)

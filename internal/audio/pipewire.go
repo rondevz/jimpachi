@@ -28,6 +28,7 @@ func New() Adapter {
 }
 
 const discoveryTimeout = 2 * time.Second
+const recoveryProbeTimeout = 2 * time.Second
 
 type outputRunner func(context.Context, string, ...string) ([]byte, error)
 
@@ -202,6 +203,19 @@ func (p pipeWire) Start(ctx context.Context, source Source, path string) (Captur
 	capture := &processCapture{cancelInput: cancelInput, cancelEncoder: cancelEncoder, input: input, encoder: encoder, stdout: stdout, encoderOutput: encoderOutput, done: make(chan struct{})}
 	go capture.supervise()
 	return capture, nil
+}
+
+// Playable reports whether FFmpeg can decode captured audio left by an interrupted process.
+func (p pipeWire) Playable(ctx context.Context, path string) (bool, error) {
+	if err := p.lookPath("ffprobe"); err != nil {
+		return false, fmt.Errorf("check interrupted Recording audio: ffprobe is unavailable: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, recoveryProbeTimeout)
+	defer cancel()
+	if _, err := p.run(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", path); err != nil {
+		return false, fmt.Errorf("probe interrupted Recording audio: %w", err)
+	}
+	return true, nil
 }
 
 type processCapture struct {

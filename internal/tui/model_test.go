@@ -50,6 +50,139 @@ func TestModelShowsMissingAudioCondition(t *testing.T) {
 	}
 }
 
+func TestModelShowsInterruptedRecording(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: "Interrupted", Interrupted: true}}}))
+	if !strings.Contains(model.View(), "Interrupted capture") {
+		t.Errorf("View() = %q, want interrupted capture marker", model.View())
+	}
+}
+
+func TestModelShowsRecoveryAndAutomaticStopFailures(t *testing.T) {
+	active := &app.ActiveRecording{ID: "recording-1"}
+	model := load(t, New(context.Background(), fakeHistory{startup: app.Startup{RecoveryWarning: "Could not verify interrupted Recording"}}))
+	if !strings.Contains(model.View(), "Could not verify interrupted Recording") {
+		t.Errorf("View() = %q, want recovery warning", model.View())
+	}
+	model.active = active
+	model.workflow = fakeHistory{captureState: app.CaptureState{Failure: "context deadline exceeded"}}
+	updated, _ := model.Update(recordingTick{})
+	model = updated.(Model)
+	if model.active != nil || !strings.Contains(model.View(), "Recording failed: context deadline exceeded") {
+		t.Errorf("View() = %q, want automatic stop failure", updated.View())
+	}
+}
+
+func TestModelLetsUserDisableRecordingLimit(t *testing.T) {
+	savedLimit := time.Hour
+	workflow := fakeHistory{limit: time.Hour, savedLimit: &savedLimit}
+	model := load(t, New(context.Background(), workflow))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if command == nil {
+		t.Fatal("limit toggle did not issue a workflow command")
+	}
+	updated, _ = updated.Update(command())
+	model = updated.(Model)
+	if savedLimit != 0 || !strings.Contains(model.View(), "Recording limit: disabled") {
+		t.Errorf("limit toggle saved %v; View() = %q", savedLimit, model.View())
+	}
+}
+
+func TestModelRollsBackRecordingLimitAfterTerminalSaveFailure(t *testing.T) {
+	workflow := fakeHistory{limit: time.Hour, limitErr: errors.New("disk full")}
+	model := load(t, New(context.Background(), workflow))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	model = updated.(Model)
+	if model.recordingLimit != 65*time.Minute {
+		t.Fatalf("optimistic Recording limit = %v, want 65m", model.recordingLimit)
+	}
+	updated, next := model.Update(command())
+	model = updated.(Model)
+	if next != nil || model.recordingLimit != time.Hour {
+		t.Errorf("terminal save failure left command %v and limit %v, want no command and 1h", next != nil, model.recordingLimit)
+	}
+}
+
+func TestModelSerializesRapidRecordingLimitAdjustments(t *testing.T) {
+	writes := []time.Duration{}
+	workflow := fakeHistory{limit: time.Hour, limitWrites: &writes}
+	model := load(t, New(context.Background(), workflow))
+	updated, first := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	model = updated.(Model)
+	updated, second := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	model = updated.(Model)
+	if second != nil || model.recordingLimit != 70*time.Minute {
+		t.Fatalf("rapid adjustments returned second command %v and limit %v, want queued 70m", second != nil, model.recordingLimit)
+	}
+	updated, next := model.Update(first())
+	model = updated.(Model)
+	if next == nil {
+		t.Fatal("first save did not flush the latest intended limit")
+	}
+	_, _ = model.Update(next())
+	if got, want := writes, []time.Duration{65 * time.Minute, 70 * time.Minute}; !sameDurations(got, want) {
+		t.Errorf("SetRecordingLimit() calls = %v, want %v", got, want)
+	}
+}
+
+func TestModelSerializesRecordingLimitToggleAfterAdjustment(t *testing.T) {
+	writes := []time.Duration{}
+	model := load(t, New(context.Background(), fakeHistory{limit: time.Hour, limitWrites: &writes}))
+	updated, first := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	model = updated.(Model)
+	updated, second := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	model = updated.(Model)
+	if second != nil || model.recordingLimit != 0 {
+		t.Fatalf("toggle returned second command %v and limit %v, want queued disabled limit", second != nil, model.recordingLimit)
+	}
+	updated, next := model.Update(first())
+	if next == nil {
+		t.Fatal("first save did not flush disabled limit")
+	}
+	_, _ = updated.Update(next())
+	if got, want := writes, []time.Duration{65 * time.Minute, 0}; !sameDurations(got, want) {
+		t.Errorf("SetRecordingLimit() calls = %v, want %v", got, want)
+	}
+}
+
+func TestModelShowsRecordingLimitWarningAndAutomaticCompletion(t *testing.T) {
+	completed := recording.Recording{ID: "recording-1", Title: "Timed recording", Duration: 10 * time.Minute}
+	active := &app.ActiveRecording{ID: completed.ID, StartedAt: time.Now(), Source: audio.Source{Name: "Speakers"}}
+	workflow := fakeHistory{captureState: app.CaptureState{Active: active, Warning: "Recording will stop in 5m0s."}}
+	model := Model{workflow: workflow, active: active}
+	updated, _ := model.Update(recordingTick{})
+	model = updated.(Model)
+	if !strings.Contains(model.View(), "Recording will stop in 5m0s.") {
+		t.Errorf("View() = %q, want recording-limit warning", model.View())
+	}
+	workflow.captureState = app.CaptureState{Completed: &completed}
+	model.workflow = workflow
+	updated, _ = model.Update(recordingTick{})
+	model = updated.(Model)
+	if model.detail == nil || model.detail.ID != completed.ID {
+		t.Errorf("automatic completion detail = %#v, want %#v", model.detail, completed)
+	}
+	if strings.Contains(model.View(), "Recording will stop") {
+		t.Errorf("View() = %q, retained warning after automatic completion", model.View())
+	}
+}
+
+func TestModelClearsRecordingLimitWarningWhenRecordingStartsOrStops(t *testing.T) {
+	active := app.ActiveRecording{ID: "recording-1"}
+	model := Model{workflow: fakeHistory{}, warning: "Recording will stop in 5m0s.", startPending: true}
+	updated, _ := model.Update(recordingStarted{recording: active})
+	model = updated.(Model)
+	if model.warning != "" {
+		t.Errorf("warning after Recording start = %q, want empty", model.warning)
+	}
+	model.warning = "Recording will stop in 5m0s."
+	model.stopPending = true
+	updated, _ = model.Update(recordingStopped{recording: recording.Recording{ID: active.ID}})
+	model = updated.(Model)
+	if model.warning != "" {
+		t.Errorf("warning after Recording stop = %q, want empty", model.warning)
+	}
+}
+
 func TestModelHistoryLoadCanBeCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -410,9 +543,14 @@ type fakeHistory struct {
 	started      app.ActiveRecording
 	stopped      recording.Recording
 	captureState app.CaptureState
+	startup      app.Startup
+	limit        time.Duration
+	savedLimit   *time.Duration
+	limitWrites  *[]time.Duration
+	limitErr     error
 }
 
-func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return app.Startup{}, nil }
+func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return f.startup, nil }
 
 func (f fakeHistory) AudioSources(context.Context) (app.AudioState, error) {
 	return app.AudioState{Sources: f.sources}, f.audioErr
@@ -438,6 +576,30 @@ func (f fakeHistory) StopRecording(context.Context) (recording.Recording, error)
 func (f fakeHistory) RenameRecording(context.Context, string, string) error { return nil }
 
 func (f fakeHistory) CaptureState() app.CaptureState { return f.captureState }
+
+func (f fakeHistory) RecordingLimit(context.Context) (time.Duration, error) { return f.limit, nil }
+
+func (f fakeHistory) SetRecordingLimit(_ context.Context, limit time.Duration) error {
+	if f.savedLimit != nil {
+		*f.savedLimit = limit
+	}
+	if f.limitWrites != nil {
+		*f.limitWrites = append(*f.limitWrites, limit)
+	}
+	return f.limitErr
+}
+
+func sameDurations(got, want []time.Duration) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
 
 func (f fakeHistory) History(context.Context) ([]recording.Recording, error) {
 	return f.recordings, f.err
@@ -474,3 +636,9 @@ func (f blockingHistory) StopRecording(context.Context) (recording.Recording, er
 func (f blockingHistory) RenameRecording(context.Context, string, string) error { return nil }
 
 func (f blockingHistory) CaptureState() app.CaptureState { return app.CaptureState{} }
+
+func (f blockingHistory) RecordingLimit(context.Context) (time.Duration, error) {
+	return time.Hour, nil
+}
+
+func (f blockingHistory) SetRecordingLimit(context.Context, time.Duration) error { return nil }

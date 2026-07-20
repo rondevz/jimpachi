@@ -24,34 +24,42 @@ type Workflow interface {
 	StopRecording(context.Context) (recording.Recording, error)
 	RenameRecording(context.Context, string, string) error
 	CaptureState() app.CaptureState
+	RecordingLimit(context.Context) (time.Duration, error)
+	SetRecordingLimit(context.Context, time.Duration) error
 }
 
 // Model renders Jimpachi's Recording history.
 type Model struct {
-	ctx            context.Context
-	workflow       Workflow
-	recordings     []recording.Recording
-	err            error
-	reminder       string
-	sources        []audio.Source
-	selected       audio.Source
-	sourceIndex    int
-	discoveryError string
-	activity       float64
-	activityErr    error
-	generation     uint64
-	confirmation   uint64
-	canUsePath     bool
-	enteringPath   bool
-	path           string
-	active         *app.ActiveRecording
-	detail         *recording.Recording
-	editingTitle   bool
-	title          string
-	startPending   bool
-	stopPending    bool
-	stopAfterStart bool
-	recordingOp    uint64
+	ctx             context.Context
+	workflow        Workflow
+	recordings      []recording.Recording
+	err             error
+	reminder        string
+	recoveryWarning string
+	sources         []audio.Source
+	selected        audio.Source
+	sourceIndex     int
+	discoveryError  string
+	activity        float64
+	activityErr     error
+	generation      uint64
+	confirmation    uint64
+	canUsePath      bool
+	enteringPath    bool
+	path            string
+	active          *app.ActiveRecording
+	detail          *recording.Recording
+	editingTitle    bool
+	title           string
+	startPending    bool
+	stopPending     bool
+	stopAfterStart  bool
+	recordingOp     uint64
+	recordingLimit  time.Duration
+	persistedLimit  time.Duration
+	limitSaving     bool
+	savingLimit     time.Duration
+	warning         string
 }
 
 // New creates a terminal model backed by Recording history.
@@ -65,7 +73,8 @@ func (m Model) Init() tea.Cmd {
 		startup, startupErr := m.workflow.Startup(m.ctx)
 		recordings, historyErr := m.workflow.History(m.ctx)
 		sources, audioErr := m.workflow.AudioSources(m.ctx)
-		return initialLoaded{startup: startup, startupErr: startupErr, recordings: recordings, historyErr: historyErr, audio: sources, audioErr: audioErr}
+		limit, limitErr := m.workflow.RecordingLimit(m.ctx)
+		return initialLoaded{startup: startup, startupErr: startupErr, recordings: recordings, historyErr: historyErr, audio: sources, audioErr: audioErr, limit: limit, limitErr: limitErr}
 	}
 }
 
@@ -76,10 +85,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.recordings = message.recordings
 		m.err = message.historyErr
 		m.reminder = message.startup.Reminder
+		m.recoveryWarning = message.startup.RecoveryWarning
 		m.sources = message.audio.Sources
 		m.selected = message.audio.Selected
 		m.discoveryError = message.audio.DiscoveryError
 		m.canUsePath = message.audio.CanUseExplicitPath
+		m.recordingLimit = message.limit
+		m.persistedLimit = message.limit
 		for index, source := range m.sources {
 			if source.ID == m.selected.ID {
 				m.sourceIndex = index
@@ -93,7 +105,28 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.discoveryError = message.audioErr.Error()
 			m.canUsePath = len(m.sources) == 0
 		}
+		if message.limitErr != nil && m.err == nil {
+			m.err = message.limitErr
+		}
 		return m, m.activityCommand()
+	case recordingLimitSaved:
+		if !m.limitSaving || message.limit != m.savingLimit {
+			return m, nil
+		}
+		m.limitSaving = false
+		if message.err != nil {
+			m.err = message.err
+			if m.recordingLimit != message.limit {
+				return m, m.queueRecordingLimit(m.recordingLimit)
+			}
+			m.recordingLimit = m.persistedLimit
+			return m, nil
+		}
+		m.persistedLimit = message.limit
+		if m.recordingLimit != message.limit {
+			return m, m.queueRecordingLimit(m.recordingLimit)
+		}
+		return m, nil
 	case sourceActivity:
 		if len(m.sources) == 0 || message.sourceID != m.sources[m.sourceIndex].ID || message.generation != m.generation {
 			return m, nil
@@ -138,6 +171,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.startPending = false
+		m.warning = ""
 		if message.err != nil {
 			m.stopAfterStart = false
 			m.err = message.err
@@ -164,6 +198,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.stopPending = false
 		m.active = nil
+		m.warning = ""
 		if message.err != nil {
 			if state := m.workflow.CaptureState(); state.Active != nil {
 				m.active = state.Active
@@ -176,11 +211,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case recordingTick:
 		state := m.workflow.CaptureState()
+		if state.Completed != nil {
+			m.active = nil
+			m.stopPending = false
+			m.warning = ""
+			m.detail = state.Completed
+			m.recordings = append([]recording.Recording{*state.Completed}, m.recordings...)
+			return m, nil
+		}
+		m.warning = state.Warning
 		if state.Failure != "" {
 			m.active = nil
 			m.startPending = false
 			m.stopPending = false
 			m.stopAfterStart = false
+			m.warning = ""
 			m.err = fmt.Errorf("Recording failed: %s", state.Failure)
 			return m, nil
 		}
@@ -193,6 +238,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopPending = false
 			m.startPending = false
 			m.stopAfterStart = false
+			m.warning = ""
 			m.err = fmt.Errorf("Recording ended without a completed result")
 		}
 		return m, nil
@@ -262,6 +308,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if m.active == nil && !m.startPending && !m.stopPending {
 				m.recordingOp++
 				m.startPending = true
+				m.warning = ""
 				return m, m.startRecording(m.recordingOp)
 			}
 		case "s":
@@ -304,6 +351,26 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.enteringPath = true
 				m.path = ""
 			}
+		case "l":
+			if m.active == nil && !m.startPending && !m.stopPending {
+				limit := time.Hour
+				if m.recordingLimit > 0 {
+					limit = 0
+				}
+				return m, m.queueRecordingLimit(limit)
+			}
+		case "[":
+			if m.active == nil && !m.startPending && !m.stopPending && m.recordingLimit > 5*time.Minute {
+				return m, m.queueRecordingLimit(m.recordingLimit - 5*time.Minute)
+			}
+		case "]":
+			if m.active == nil && !m.startPending && !m.stopPending {
+				limit := m.recordingLimit + 5*time.Minute
+				if m.recordingLimit == 0 {
+					limit = time.Hour
+				}
+				return m, m.queueRecordingLimit(limit)
+			}
 		}
 	}
 
@@ -316,6 +383,9 @@ func (m Model) View() string {
 	view.WriteString("Jimpachi\n\n")
 	if m.reminder != "" {
 		fmt.Fprintf(&view, "%s\n\n", m.reminder)
+	}
+	if m.recoveryWarning != "" {
+		fmt.Fprintf(&view, "%s\n\n", m.recoveryWarning)
 	}
 	view.WriteString("Audio source\n\n")
 	if m.discoveryError != "" {
@@ -344,9 +414,17 @@ func (m Model) View() string {
 	}
 	if m.active != nil {
 		fmt.Fprintf(&view, "RECORDING  %s  %s %s\n", time.Since(m.active.StartedAt).Round(time.Second), terminalText(m.active.Source.Name), meter(m.activity))
+		if m.warning != "" {
+			fmt.Fprintf(&view, "%s\n", m.warning)
+		}
 		view.WriteString("Press s to stop capture.\n\n")
 	} else {
 		view.WriteString("Press r to start capture from the selected source.\n\n")
+	}
+	if m.recordingLimit == 0 {
+		view.WriteString("Recording limit: disabled. Press l to enable.\n\n")
+	} else {
+		fmt.Fprintf(&view, "Recording limit: %s. Press [ or ] to adjust; l disables.\n\n", m.recordingLimit)
 	}
 	if m.detail != nil {
 		view.WriteString("Recording detail\n\n")
@@ -358,6 +436,9 @@ func (m Model) View() string {
 			fmt.Fprintf(&view, "ID: %s\nStarted: %s\nDuration: %s\nAudio: %s\n", terminalText(m.detail.ID), m.detail.StartedAt.Local().Format("2006-01-02 15:04:05"), m.detail.Duration.Round(time.Second), terminalText(m.detail.AudioPath))
 			if m.detail.AudioMissing {
 				view.WriteString("Audio file is missing.\n")
+			}
+			if m.detail.Interrupted {
+				view.WriteString("Interrupted capture recovered after restart.\n")
 			}
 			view.WriteString("Press e to edit title; esc returns to history.\n")
 		}
@@ -380,6 +461,9 @@ func (m Model) View() string {
 		if recording.AudioMissing {
 			view.WriteString("Audio file is missing.\n\n")
 		}
+		if recording.Interrupted {
+			view.WriteString("Interrupted capture recovered after restart.\n\n")
+		}
 	}
 
 	return view.String()
@@ -392,6 +476,8 @@ type initialLoaded struct {
 	startupErr error
 	audio      app.AudioState
 	audioErr   error
+	limit      time.Duration
+	limitErr   error
 }
 
 type sourceActivity struct {
@@ -423,6 +509,10 @@ type recordingTick struct{}
 type recordingRenamed struct {
 	id    string
 	title string
+	err   error
+}
+type recordingLimitSaved struct {
+	limit time.Duration
 	err   error
 }
 
@@ -464,6 +554,22 @@ func (m Model) renameRecording(id, title string) tea.Cmd {
 		err := m.workflow.RenameRecording(m.ctx, id, title)
 		return recordingRenamed{id: id, title: title, err: err}
 	}
+}
+
+func (m Model) saveRecordingLimit(limit time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		return recordingLimitSaved{limit: limit, err: m.workflow.SetRecordingLimit(m.ctx, limit)}
+	}
+}
+
+func (m *Model) queueRecordingLimit(limit time.Duration) tea.Cmd {
+	m.recordingLimit = limit
+	if m.limitSaving {
+		return nil
+	}
+	m.limitSaving = true
+	m.savingLimit = limit
+	return m.saveRecordingLimit(limit)
 }
 
 func (m *Model) clearActivity() {

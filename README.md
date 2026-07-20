@@ -25,6 +25,8 @@ go run .
 
 Press `q` to quit. Press `r` to capture the selected source and `s` to stop. Stopping opens Recording detail; press `e` there to edit its title. Audio is stored under the Jimpachi data directory as mono 32 kbps Opus.
 
+Recordings default to a 60-minute limit. Jimpachi warns five minutes before it stops only its own system-output capture; it never ends or changes the underlying call. Press `[` or `]` to adjust the limit in five-minute increments, or `l` to disable and re-enable it. The chosen limit is stored locally. If Jimpachi is interrupted, it recovers a decodable staged audio file on the next start and marks that Recording as interrupted.
+
 Jimpachi lists system-output monitor sources, rather than microphone inputs. Use the arrow keys to highlight a source and `enter` to save it. If source discovery is unavailable, press `a` and enter the monitor source path shown by your audio server; Jimpachi stores that selection locally. It never installs audio dependencies or changes `PATH`.
 
 ## Storage

@@ -70,6 +70,26 @@ func TestSourcesExplainsHowToRecoverWhenNoActivityMeterIsAvailable(t *testing.T)
 	}
 }
 
+func TestPlayableBoundsFFprobeWithTimeout(t *testing.T) {
+	adapter := pipeWire{
+		lookPath: func(string) error { return nil },
+		run: func(ctx context.Context, name string, _ ...string) ([]byte, error) {
+			if name != "ffprobe" {
+				t.Fatalf("command = %q, want ffprobe", name)
+			}
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) > recoveryProbeTimeout+100*time.Millisecond {
+				t.Errorf("ffprobe deadline = %v, want bounded timeout", deadline)
+			}
+			return nil, context.DeadlineExceeded
+		},
+	}
+	playable, err := adapter.Playable(context.Background(), "/recordings/interrupted.partial.opus")
+	if playable || err == nil {
+		t.Errorf("Playable() = %t, %v; want probe failure", playable, err)
+	}
+}
+
 func TestStartExplainsWhenFFmpegIsUnavailable(t *testing.T) {
 	adapter := pipeWire{
 		lookPath: func(name string) error {
