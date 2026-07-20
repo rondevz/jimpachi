@@ -7,6 +7,10 @@ description: Test-driven development. Use when the user wants to build features 
 
 TDD is the red → green loop. This skill is the reference that makes that loop produce tests worth keeping: what a good test is, where tests go, the anti-patterns, and the rules of the loop. Every section applies on every cycle — consult them before and during the loop, not after.
 
+## Go conventions
+
+Use Go's standard `testing` package by default. Keep tests in `*_test.go` files beside the package they exercise, use `TestXxx` names that describe observable behavior, and run `go test ./...`. Prefer standard-library fakes and explicit interfaces over a mocking framework. Use table-driven tests only when the same behavior has several meaningful inputs and expected outcomes.
+
 When exploring the codebase, read `CONTEXT.md` (if it exists) so test names and interface vocabulary match the project's domain language, and respect ADRs in the area you're touching.
 
 ## What a good test is
