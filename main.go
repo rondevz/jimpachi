@@ -34,8 +34,8 @@ func run() error {
 
 	p := tea.NewProgram(tui.New(ctx, workflow))
 	_, runErr := p.Run()
-	cancel()
 	closeErr := workflow.Close()
+	cancel()
 	if runErr != nil {
 		return fmt.Errorf("run terminal program: %w", errors.Join(runErr, closeErr))
 	}

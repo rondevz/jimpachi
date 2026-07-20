@@ -20,6 +20,10 @@ type Workflow interface {
 	AudioSources(context.Context) (app.AudioState, error)
 	SelectAudioSource(context.Context, audio.Source, uint64) error
 	AudioActivity(context.Context, audio.Source) (float64, error)
+	StartRecording(context.Context) (app.ActiveRecording, error)
+	StopRecording(context.Context) (recording.Recording, error)
+	RenameRecording(context.Context, string, string) error
+	CaptureState() app.CaptureState
 }
 
 // Model renders Jimpachi's Recording history.
@@ -40,6 +44,14 @@ type Model struct {
 	canUsePath     bool
 	enteringPath   bool
 	path           string
+	active         *app.ActiveRecording
+	detail         *recording.Recording
+	editingTitle   bool
+	title          string
+	startPending   bool
+	stopPending    bool
+	stopAfterStart bool
+	recordingOp    uint64
 }
 
 // New creates a terminal model backed by Recording history.
@@ -121,10 +133,107 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.activityCommand()
+	case recordingStarted:
+		if message.operation != m.recordingOp || !m.startPending {
+			return m, nil
+		}
+		m.startPending = false
+		if message.err != nil {
+			m.stopAfterStart = false
+			m.err = message.err
+			return m, nil
+		}
+		m.active = &message.recording
+		for index, source := range m.sources {
+			if source.ID == message.recording.Source.ID {
+				m.sourceIndex = index
+				break
+			}
+		}
+		m.generation++
+		m.clearActivity()
+		if m.stopAfterStart {
+			m.stopAfterStart = false
+			m.stopPending = true
+			return m, m.stopRecording(m.recordingOp)
+		}
+		return m, tea.Batch(m.activityCommand(), tea.Tick(time.Second, func(time.Time) tea.Msg { return recordingTick{} }))
+	case recordingStopped:
+		if message.operation != m.recordingOp || !m.stopPending {
+			return m, nil
+		}
+		m.stopPending = false
+		m.active = nil
+		if message.err != nil {
+			if state := m.workflow.CaptureState(); state.Active != nil {
+				m.active = state.Active
+			}
+			m.err = message.err
+			return m, nil
+		}
+		m.detail = &message.recording
+		m.recordings = append([]recording.Recording{message.recording}, m.recordings...)
+		return m, nil
+	case recordingTick:
+		state := m.workflow.CaptureState()
+		if state.Failure != "" {
+			m.active = nil
+			m.startPending = false
+			m.stopPending = false
+			m.stopAfterStart = false
+			m.err = fmt.Errorf("Recording failed: %s", state.Failure)
+			return m, nil
+		}
+		if state.Active != nil {
+			m.active = state.Active
+			return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return recordingTick{} })
+		}
+		if m.active != nil || m.stopPending {
+			m.active = nil
+			m.stopPending = false
+			m.startPending = false
+			m.stopAfterStart = false
+			m.err = fmt.Errorf("Recording ended without a completed result")
+		}
+		return m, nil
+	case recordingRenamed:
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		if m.detail != nil {
+			m.detail.Title = message.title
+		}
+		for index := range m.recordings {
+			if m.recordings[index].ID == message.id {
+				m.recordings[index].Title = message.title
+			}
+		}
+		m.editingTitle = false
+		return m, nil
 	case tea.KeyMsg:
 		key := message.String()
 		if key == "q" || key == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if m.editingTitle {
+			switch key {
+			case "esc":
+				m.editingTitle = false
+			case "enter":
+				if m.detail != nil && m.title != "" {
+					return m, m.renameRecording(m.detail.ID, m.title)
+				}
+			case "backspace":
+				if len(m.title) > 0 {
+					m.title = m.title[:len(m.title)-1]
+				}
+			default:
+				if len(key) == 1 {
+					m.title += key
+				}
+			}
+			return m, nil
 		}
 		if m.enteringPath {
 			switch key {
@@ -149,29 +258,49 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch key {
+		case "r":
+			if m.active == nil && !m.startPending && !m.stopPending {
+				m.recordingOp++
+				m.startPending = true
+				return m, m.startRecording(m.recordingOp)
+			}
+		case "s":
+			if m.startPending {
+				m.stopAfterStart = true
+			} else if m.active != nil && !m.stopPending {
+				m.stopPending = true
+				return m, m.stopRecording(m.recordingOp)
+			}
+		case "e":
+			if m.detail != nil {
+				m.editingTitle = true
+				m.title = m.detail.Title
+			}
+		case "esc":
+			m.detail = nil
 		case "up", "k":
-			if m.sourceIndex > 0 {
+			if m.active == nil && m.sourceIndex > 0 {
 				m.sourceIndex--
 				m.generation++
 				m.clearActivity()
 				return m, m.activityCommand()
 			}
 		case "down", "j":
-			if m.sourceIndex+1 < len(m.sources) {
+			if m.active == nil && m.sourceIndex+1 < len(m.sources) {
 				m.sourceIndex++
 				m.generation++
 				m.clearActivity()
 				return m, m.activityCommand()
 			}
 		case "enter":
-			if len(m.sources) > 0 {
+			if m.active == nil && len(m.sources) > 0 {
 				m.confirmation++
 				m.generation++
 				m.clearActivity()
 				return m, m.selectSource(m.sources[m.sourceIndex], m.confirmation)
 			}
 		case "a":
-			if m.canUsePath {
+			if m.active == nil && m.canUsePath {
 				m.enteringPath = true
 				m.path = ""
 			}
@@ -213,6 +342,27 @@ func (m Model) View() string {
 	if m.activityErr != nil {
 		fmt.Fprintf(&view, "Unable to measure Audio activity: %v\n\n", m.activityErr)
 	}
+	if m.active != nil {
+		fmt.Fprintf(&view, "RECORDING  %s  %s %s\n", time.Since(m.active.StartedAt).Round(time.Second), terminalText(m.active.Source.Name), meter(m.activity))
+		view.WriteString("Press s to stop capture.\n\n")
+	} else {
+		view.WriteString("Press r to start capture from the selected source.\n\n")
+	}
+	if m.detail != nil {
+		view.WriteString("Recording detail\n\n")
+		if m.editingTitle {
+			fmt.Fprintf(&view, "Title: %s_\n", terminalText(m.title))
+			view.WriteString("Enter saves title; esc cancels.\n")
+		} else {
+			fmt.Fprintf(&view, "%s\n", terminalText(m.detail.Title))
+			fmt.Fprintf(&view, "ID: %s\nStarted: %s\nDuration: %s\nAudio: %s\n", terminalText(m.detail.ID), m.detail.StartedAt.Local().Format("2006-01-02 15:04:05"), m.detail.Duration.Round(time.Second), terminalText(m.detail.AudioPath))
+			if m.detail.AudioMissing {
+				view.WriteString("Audio file is missing.\n")
+			}
+			view.WriteString("Press e to edit title; esc returns to history.\n")
+		}
+		return view.String()
+	}
 	view.WriteString("Recording history\n\n")
 
 	if m.err != nil {
@@ -225,8 +375,11 @@ func (m Model) View() string {
 	}
 
 	for _, recording := range m.recordings {
-		fmt.Fprintf(&view, "%s\n", recording.Title)
+		fmt.Fprintf(&view, "%s\n", terminalText(recording.Title))
 		fmt.Fprintf(&view, "%s  %s\n\n", recording.StartedAt.Local().Format("2006-01-02 15:04"), recording.Duration.Round(1e9))
+		if recording.AudioMissing {
+			view.WriteString("Audio file is missing.\n\n")
+		}
 	}
 
 	return view.String()
@@ -256,6 +409,22 @@ type sourceSelected struct {
 	confirmation uint64
 	err          error
 }
+type recordingStarted struct {
+	recording app.ActiveRecording
+	err       error
+	operation uint64
+}
+type recordingStopped struct {
+	recording recording.Recording
+	err       error
+	operation uint64
+}
+type recordingTick struct{}
+type recordingRenamed struct {
+	id    string
+	title string
+	err   error
+}
 
 func (m Model) activityCommand() tea.Cmd {
 	if len(m.sources) == 0 {
@@ -273,6 +442,27 @@ func (m Model) selectSource(source audio.Source, confirmation uint64) tea.Cmd {
 	return func() tea.Msg {
 		err := m.workflow.SelectAudioSource(m.ctx, source, confirmation)
 		return sourceSelected{source: source, confirmation: confirmation, err: err}
+	}
+}
+
+func (m Model) startRecording(operation uint64) tea.Cmd {
+	return func() tea.Msg {
+		recording, err := m.workflow.StartRecording(m.ctx)
+		return recordingStarted{recording: recording, err: err, operation: operation}
+	}
+}
+
+func (m Model) stopRecording(operation uint64) tea.Cmd {
+	return func() tea.Msg {
+		recording, err := m.workflow.StopRecording(m.ctx)
+		return recordingStopped{recording: recording, err: err, operation: operation}
+	}
+}
+
+func (m Model) renameRecording(id, title string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.workflow.RenameRecording(m.ctx, id, title)
+		return recordingRenamed{id: id, title: title, err: err}
 	}
 }
 

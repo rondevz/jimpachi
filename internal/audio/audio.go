@@ -1,4 +1,4 @@
-// Package audio discovers system-output monitors and measures their activity.
+// Package audio discovers and captures system-output monitors.
 package audio
 
 import "context"
@@ -14,4 +14,11 @@ type Source struct {
 type Adapter interface {
 	Sources(context.Context) ([]Source, error)
 	Activity(context.Context, Source) (float64, error)
+	Start(context.Context, Source, string) (Capture, error)
+}
+
+// Capture is a running system-output capture that can be stopped cleanly.
+type Capture interface {
+	Stop(context.Context) error
+	Wait() error
 }

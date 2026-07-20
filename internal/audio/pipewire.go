@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -145,6 +149,153 @@ func (p pipeWire) Activity(ctx context.Context, source Source) (float64, error) 
 		}
 	}
 	return activity(ctx, "parec", "--device", source.ID, "--raw", "--format=s16le", "--rate=48000", "--channels=1")
+}
+
+// Start captures a monitor as raw PCM and gives FFmpeg sole responsibility for
+// encoding the final, portable mono Opus file.
+func (p pipeWire) Start(ctx context.Context, source Source, path string) (Capture, error) {
+	if source.ID == "" {
+		return nil, fmt.Errorf("start Audio capture: source path is required")
+	}
+	if err := p.lookPath("ffmpeg"); err != nil {
+		return nil, fmt.Errorf("start Audio capture: ffmpeg is unavailable: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create Recording directory: %w", err)
+	}
+
+	command := "pw-cat"
+	arguments := []string{"--record", "--target", source.ID, "--format", "s16", "--rate", "48000", "--channels", "1", "-"}
+	if p.lookPath(command) != nil {
+		if err := p.lookPath("parec"); err != nil {
+			return nil, fmt.Errorf("start Audio capture: pw-cat and parec are unavailable: %w", err)
+		}
+		command = "parec"
+		arguments = []string{"--device", source.ID, "--raw", "--format=s16le", "--rate=48000", "--channels=1"}
+	}
+
+	captureCtx, cancelInput := context.WithCancel(ctx)
+	input := exec.CommandContext(captureCtx, command, arguments...)
+	stdout, err := input.StdoutPipe()
+	if err != nil {
+		cancelInput()
+		return nil, fmt.Errorf("open %s audio stream: %w", command, err)
+	}
+	if err := input.Start(); err != nil {
+		cancelInput()
+		return nil, fmt.Errorf("start %s audio stream: %w", command, err)
+	}
+
+	encoderCtx, cancelEncoder := context.WithCancel(ctx)
+	encoder := exec.CommandContext(encoderCtx, "ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k", path)
+	encoderInput, encoderOutput := io.Pipe()
+	encoder.Stdin = encoderInput
+	if err := encoder.Start(); err != nil {
+		_ = encoderInput.Close()
+		_ = encoderOutput.Close()
+		cancelEncoder()
+		cancelInput()
+		_ = input.Wait()
+		return nil, fmt.Errorf("start FFmpeg encoder: %w", err)
+	}
+
+	capture := &processCapture{cancelInput: cancelInput, cancelEncoder: cancelEncoder, input: input, encoder: encoder, stdout: stdout, encoderOutput: encoderOutput, done: make(chan struct{})}
+	go capture.supervise()
+	return capture, nil
+}
+
+type processCapture struct {
+	cancelInput   context.CancelFunc
+	cancelEncoder context.CancelFunc
+	input         *exec.Cmd
+	encoder       *exec.Cmd
+	stdout        io.ReadCloser
+	encoderOutput *io.PipeWriter
+	once          sync.Once
+	err           error
+	done          chan struct{}
+	mu            sync.Mutex
+	stopping      bool
+}
+
+func (c *processCapture) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	c.stopping = true
+	c.mu.Unlock()
+	c.once.Do(func() {
+		// Cancel the source first so FFmpeg receives EOF, then wait for both
+		// processes to prevent capture children surviving a stopped Recording.
+		c.cancelInput()
+		select {
+		case <-c.done:
+		case <-ctx.Done():
+			c.cancelEncoder()
+			<-c.done
+		}
+	})
+	return c.Wait()
+}
+
+func (c *processCapture) Wait() error {
+	<-c.done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+func (c *processCapture) supervise() {
+	sourceDone := make(chan error, 1)
+	encoderDone := make(chan error, 1)
+	go func() {
+		// Drain the PCM pipe before Wait closes it, so FFmpeg receives every
+		// captured sample that was already buffered when capture stops.
+		sourceDone <- drainCapture(c.stdout, c.encoderOutput, c.input.Wait)
+	}()
+	go func() { encoderDone <- c.encoder.Wait() }()
+
+	var inputErr, encoderErr error
+	inputFinished := false
+	select {
+	case inputErr = <-sourceDone:
+		inputFinished = true
+	case encoderErr = <-encoderDone:
+	}
+	c.mu.Lock()
+	stopping := c.stopping
+	c.mu.Unlock()
+	if !stopping {
+		c.cancelInput()
+		c.cancelEncoder()
+	}
+	if inputFinished {
+		encoderErr = <-encoderDone
+	} else {
+		inputErr = <-sourceDone
+	}
+	c.mu.Lock()
+	if stopping {
+		if !expectedStopError(inputErr) || !expectedStopError(encoderErr) {
+			c.err = fmt.Errorf("stop Audio capture: source: %v; FFmpeg: %v", inputErr, encoderErr)
+		}
+	} else {
+		c.err = fmt.Errorf("Audio capture ended unexpectedly: source: %v; FFmpeg: %v", inputErr, encoderErr)
+	}
+	c.mu.Unlock()
+	close(c.done)
+}
+
+func drainCapture(input io.Reader, output *io.PipeWriter, wait func() error) error {
+	_, copyErr := io.Copy(output, input)
+	_ = output.CloseWithError(copyErr)
+	inputErr := wait()
+	if copyErr != nil {
+		return fmt.Errorf("copy Audio capture stream: %w", copyErr)
+	}
+	return inputErr
+}
+
+func expectedStopError(err error) bool {
+	return err == nil || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "signal: killed")
 }
 
 func activity(ctx context.Context, command string, arguments ...string) (float64, error) {

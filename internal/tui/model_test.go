@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,13 @@ func TestModelShowsRecordingHistory(t *testing.T) {
 	}
 	if !strings.Contains(view, "18m") {
 		t.Errorf("View() = %q, want Recording duration", view)
+	}
+}
+
+func TestModelShowsMissingAudioCondition(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: "Moved", AudioMissing: true}}}))
+	if !strings.Contains(model.View(), "Audio file is missing.") {
+		t.Errorf("View() = %q, want missing-audio condition", model.View())
 	}
 }
 
@@ -181,6 +189,148 @@ func TestModelKeepsConfirmedExplicitAudioSourceVisibleAndMetered(t *testing.T) {
 	}
 }
 
+func TestModelShowsCaptureDurationAndCompletedRecordingDetail(t *testing.T) {
+	source := audio.Source{ID: "speakers.monitor", Name: "Speakers"}
+	completed := recording.Recording{
+		ID:        "recording-1",
+		Title:     "Recording 2026-07-20 10:30",
+		StartedAt: time.Date(2026, time.July, 20, 10, 30, 0, 0, time.UTC),
+		Duration:  5 * time.Second,
+		AudioPath: "/recordings/recording-1.opus",
+	}
+	workflow := fakeHistory{
+		sources: []audio.Source{source},
+		started: app.ActiveRecording{ID: completed.ID, StartedAt: time.Now().Add(-time.Second), Source: source},
+		stopped: completed,
+	}
+	model := load(t, New(context.Background(), workflow))
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	updated, _ = updated.Update(command())
+	model = updated.(Model)
+	if !strings.Contains(model.View(), "RECORDING") || !strings.Contains(model.View(), "Press s to stop") {
+		t.Errorf("View() = %q, want active Recording duration and stop control", model.View())
+	}
+
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	updated, _ = updated.Update(command())
+	model = updated.(Model)
+	for _, want := range []string{"Recording detail", completed.ID, completed.AudioPath, "Duration: 5s"} {
+		if !strings.Contains(model.View(), want) {
+			t.Errorf("View() = %q, want %q", model.View(), want)
+		}
+	}
+}
+
+func TestModelIgnoresDuplicateAndStaleRecordingOperations(t *testing.T) {
+	source := audio.Source{ID: "speakers.monitor", Name: "Speakers"}
+	completed := recording.Recording{ID: "recording-1", Title: "Completed"}
+	workflow := fakeHistory{sources: []audio.Source{source}, started: app.ActiveRecording{ID: completed.ID, StartedAt: time.Now(), Source: source}, stopped: completed}
+	model := load(t, New(context.Background(), workflow))
+
+	updated, start := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	model = updated.(Model)
+	if start == nil {
+		t.Fatal("first start did not issue a command")
+	}
+	_, duplicateStart := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if duplicateStart != nil {
+		t.Fatal("duplicate start issued another command")
+	}
+	updated, stop := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	model = updated.(Model)
+	if stop != nil {
+		t.Fatal("stop while start is pending issued an early stop command")
+	}
+
+	updated, stop = model.Update(start())
+	model = updated.(Model)
+	if stop == nil {
+		t.Fatal("stop requested during start was not issued after start completed")
+	}
+	updated, _ = model.Update(recordingStopped{recording: completed, operation: 0})
+	model = updated.(Model)
+	if len(model.recordings) != 0 {
+		t.Errorf("stale stop result added Recording history: %#v", model.recordings)
+	}
+	_, duplicateStop := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if duplicateStop != nil {
+		t.Fatal("duplicate pending stop issued another command")
+	}
+	updated, _ = model.Update(stop())
+	model = updated.(Model)
+	if len(model.recordings) != 1 || model.recordings[0].ID != completed.ID {
+		t.Errorf("completed stop result recordings = %#v, want %#v", model.recordings, completed)
+	}
+	_, duplicateStop = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if duplicateStop != nil {
+		t.Fatal("duplicate stop issued another command")
+	}
+}
+
+func TestModelSanitizesRecordingTitlesAndPaths(t *testing.T) {
+	unsafe := "\x1b]8;;https://example.invalid\aTrusted\x1b]8;;\a\x1b[31m title\x1b[0m"
+	path := "/recordings/\x1b[31mrecording.opus"
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: unsafe, AudioPath: path}}}))
+	if view := model.View(); strings.ContainsAny(view, "\x1b\a") || strings.Contains(view, "example.invalid") {
+		t.Errorf("history View() = %q, rendered Recording terminal control content", view)
+	}
+	model.detail = &recording.Recording{Title: unsafe, AudioPath: path}
+	model.editingTitle = true
+	model.title = unsafe
+	view := model.View()
+	if strings.ContainsAny(view, "\x1b\a") || strings.Contains(view, "example.invalid") {
+		t.Errorf("View() = %q, rendered Recording terminal control content", view)
+	}
+	if !strings.Contains(view, "Trusted title") {
+		t.Errorf("View() = %q, want sanitized editable Recording title", view)
+	}
+	model.editingTitle = false
+	view = model.View()
+	if strings.ContainsAny(view, "\x1b\a") || strings.Contains(view, "example.invalid") || !strings.Contains(view, "/recordings/recording.opus") {
+		t.Errorf("View() = %q, want sanitized Recording detail title and path", view)
+	}
+}
+
+func TestModelClearsActiveRecordingAfterStopFailure(t *testing.T) {
+	model := Model{workflow: fakeHistory{}, active: &app.ActiveRecording{ID: "recording-1"}, stopPending: true, recordingOp: 1}
+	updated, _ := model.Update(recordingStopped{operation: 1, err: errors.New("save failed")})
+	model = updated.(Model)
+	if model.active != nil {
+		t.Error("active Recording remained after terminal stop failure")
+	}
+	if model.err == nil {
+		t.Error("terminal stop failure was not shown")
+	}
+}
+
+func TestModelRestoresRetryableCaptureStateAfterStopFailure(t *testing.T) {
+	retryable := &app.ActiveRecording{ID: "recording-1"}
+	model := Model{workflow: fakeHistory{captureState: app.CaptureState{Active: retryable}}, active: retryable, stopPending: true, recordingOp: 1}
+	updated, _ := model.Update(recordingStopped{operation: 1, err: errors.New("promote failed")})
+	model = updated.(Model)
+	if model.active == nil || model.active.ID != retryable.ID {
+		t.Errorf("active Recording = %#v, want retryable capture %#v", model.active, retryable)
+	}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if command == nil {
+		t.Fatal("retryable capture did not issue another stop command")
+	}
+	_ = updated
+}
+
+func TestModelClearsActiveRecordingWhenWorkflowReportsNoCaptureState(t *testing.T) {
+	model := Model{workflow: fakeHistory{}, active: &app.ActiveRecording{ID: "recording-1"}}
+	updated, _ := model.Update(recordingTick{})
+	model = updated.(Model)
+	if model.active != nil {
+		t.Error("active Recording remained after workflow reported no capture state")
+	}
+	if model.err == nil {
+		t.Error("missing workflow capture state was not shown as terminal failure")
+	}
+}
+
 func TestModelDiscardsOutOfOrderAudioSourceConfirmation(t *testing.T) {
 	speakers := audio.Source{ID: "speakers.monitor", Name: "Speakers"}
 	headphones := audio.Source{ID: "headphones.monitor", Name: "Headphones"}
@@ -251,12 +401,15 @@ func load(t *testing.T, model Model) Model {
 }
 
 type fakeHistory struct {
-	recordings []recording.Recording
-	err        error
-	sources    []audio.Source
-	audioErr   error
-	activity   float64
-	metered    *[]audio.Source
+	recordings   []recording.Recording
+	err          error
+	sources      []audio.Source
+	audioErr     error
+	activity     float64
+	metered      *[]audio.Source
+	started      app.ActiveRecording
+	stopped      recording.Recording
+	captureState app.CaptureState
 }
 
 func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return app.Startup{}, nil }
@@ -273,6 +426,18 @@ func (f fakeHistory) AudioActivity(_ context.Context, source audio.Source) (floa
 	}
 	return f.activity, nil
 }
+
+func (f fakeHistory) StartRecording(context.Context) (app.ActiveRecording, error) {
+	return f.started, nil
+}
+
+func (f fakeHistory) StopRecording(context.Context) (recording.Recording, error) {
+	return f.stopped, nil
+}
+
+func (f fakeHistory) RenameRecording(context.Context, string, string) error { return nil }
+
+func (f fakeHistory) CaptureState() app.CaptureState { return f.captureState }
 
 func (f fakeHistory) History(context.Context) ([]recording.Recording, error) {
 	return f.recordings, f.err
@@ -297,3 +462,15 @@ func (f blockingHistory) AudioSources(context.Context) (app.AudioState, error) {
 func (f blockingHistory) SelectAudioSource(context.Context, audio.Source, uint64) error { return nil }
 
 func (f blockingHistory) AudioActivity(context.Context, audio.Source) (float64, error) { return 0, nil }
+
+func (f blockingHistory) StartRecording(context.Context) (app.ActiveRecording, error) {
+	return app.ActiveRecording{}, nil
+}
+
+func (f blockingHistory) StopRecording(context.Context) (recording.Recording, error) {
+	return recording.Recording{}, nil
+}
+
+func (f blockingHistory) RenameRecording(context.Context, string, string) error { return nil }
+
+func (f blockingHistory) CaptureState() app.CaptureState { return app.CaptureState{} }

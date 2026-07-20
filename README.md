@@ -6,6 +6,7 @@ Jimpachi is a terminal application for recording system audio, transcribing reco
 
 - Go 1.24 or newer
 - PipeWire (`pw-dump`, `pw-cat`) for system-output discovery and activity metering. PulseAudio-compatible `pactl` and `parec` are used when PipeWire discovery is unavailable.
+- FFmpeg with `libopus` support for capture encoding.
 - `whisper.cpp` for local transcription (planned)
 - Ollama for optional local summaries (planned)
 
@@ -22,10 +23,10 @@ go mod tidy
 go run .
 ```
 
-Press `q` to quit the initial TUI.
+Press `q` to quit. Press `r` to capture the selected source and `s` to stop. Stopping opens Recording detail; press `e` there to edit its title. Audio is stored under the Jimpachi data directory as mono 32 kbps Opus.
 
 Jimpachi lists system-output monitor sources, rather than microphone inputs. Use the arrow keys to highlight a source and `enter` to save it. If source discovery is unavailable, press `a` and enter the monitor source path shown by your audio server; Jimpachi stores that selection locally. It never installs audio dependencies or changes `PATH`.
 
-## Planned storage
+## Storage
 
-By default, Jimpachi will store its database and recordings beneath `~/.local/share/jimpachi/` and read configuration from `~/.config/jimpachi/config.toml`.
+By default, Jimpachi stores its database and recordings beneath `~/.local/share/jimpachi/` and will read configuration from `~/.config/jimpachi/config.toml`.

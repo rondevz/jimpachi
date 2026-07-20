@@ -1,8 +1,10 @@
 package audio
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -65,5 +67,54 @@ func TestSourcesExplainsHowToRecoverWhenNoActivityMeterIsAvailable(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "pw-cat") || !strings.Contains(err.Error(), "parec") {
 		t.Errorf("Sources() error = %q, want pw-cat and parec recovery guidance", err)
+	}
+}
+
+func TestStartExplainsWhenFFmpegIsUnavailable(t *testing.T) {
+	adapter := pipeWire{
+		lookPath: func(name string) error {
+			if name == "ffmpeg" {
+				return errors.New("not found")
+			}
+			return nil
+		},
+	}
+
+	_, err := adapter.Start(context.Background(), Source{ID: "speakers.monitor"}, t.TempDir()+"/recording.opus")
+	if err == nil {
+		t.Fatal("Start() error = nil, want unavailable FFmpeg guidance")
+	}
+	if !strings.Contains(err.Error(), "ffmpeg") {
+		t.Errorf("Start() error = %q, want FFmpeg guidance", err)
+	}
+}
+
+func TestDrainCaptureCopiesAllPCMBeforeReapingInput(t *testing.T) {
+	input := bytes.NewBufferString("all buffered PCM")
+	reader, output := io.Pipe()
+	var copied bytes.Buffer
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := copied.ReadFrom(reader)
+		readDone <- err
+	}()
+	waitCalled := false
+	var readErr error
+
+	if err := drainCapture(input, output, func() error {
+		waitCalled = true
+		readErr = <-readDone
+		if readErr != nil {
+			return readErr
+		}
+		if got, want := copied.String(), "all buffered PCM"; got != want {
+			t.Errorf("PCM copied before input Wait = %q, want %q", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("drainCapture() error = %v", err)
+	}
+	if !waitCalled {
+		t.Error("input Wait was not called after draining PCM")
 	}
 }

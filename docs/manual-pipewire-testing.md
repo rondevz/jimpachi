@@ -32,6 +32,15 @@ XDG_DATA_HOME="$(mktemp -d)" go run .
 4. Confirm the explicit source remains visible in the picker and receives an activity meter.
 5. Confirm missing `pw-cat` or `parec` produces guidance identifying the missing activity-meter dependency.
 
+## Capture
+
+1. With audible system audio playing and the intended source confirmed, press `r`.
+2. Confirm the focused `RECORDING` state shows increasing elapsed duration and an updating source activity meter.
+3. Press `s` and confirm the Recording detail displays its ID, start time, duration, and `.opus` audio path.
+4. Verify the resulting file plays in a desktop audio player and is mono Opus at 32 kbps, for example: `ffprobe -v error -show_entries stream=codec_name,channels,bit_rate -of default=noprint_wrappers=1 <audio-path>`.
+5. Press `e`, change the title, press `enter`, quit, and relaunch with the same data directory. Confirm the title remains changed in Recording history.
+6. Start another capture and quit with `q`; confirm neither `pw-cat`/`parec` nor `ffmpeg` remains running afterward.
+
 ## Expected Results
 
 - Source discovery returns promptly when PipeWire is unavailable; Jimpachi must not appear hung.
@@ -41,4 +50,4 @@ XDG_DATA_HOME="$(mktemp -d)" go run .
 
 ## Not Covered Here
 
-This checklist verifies source discovery, selection, persistence, and activity metering only. Actual system-output capture, Opus encoding, Recording creation, and Transcription are covered by later tickets.
+This checklist does not cover recording-limit recovery, Transcription, or Summaries.
