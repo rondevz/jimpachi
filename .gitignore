@@ -1,0 +1,8 @@
+# Go build outputs
+jimpachi
+*.exe
+*.test
+*.out
+
+# Local application data
+.data/
