@@ -2,7 +2,10 @@ module jimpachi
 
 go 1.24.0
 
-require github.com/charmbracelet/bubbletea v1.3.10
+require (
+	github.com/charmbracelet/bubbletea v1.3.10
+	github.com/mattn/go-sqlite3 v1.14.32
+)
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect

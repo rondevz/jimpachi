@@ -1,37 +1,52 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"jimpachi/internal/app"
+	"jimpachi/internal/tui"
 )
 
-type model struct{}
+func main() {
+	if err := run(); err != nil {
+		fail(err)
+	}
+}
 
-func (model) Init() tea.Cmd {
+func run() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dataDir, err := app.DataDir()
+	if err != nil {
+		return err
+	}
+
+	workflow, err := app.Open(ctx, dataDir)
+	if err != nil {
+		return err
+	}
+
+	p := tea.NewProgram(tui.New(ctx, workflow))
+	_, runErr := p.Run()
+	cancel()
+	closeErr := workflow.Close()
+	if runErr != nil {
+		return fmt.Errorf("run terminal program: %w", errors.Join(runErr, closeErr))
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close application workflow: %w", closeErr)
+	}
+
 	return nil
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok {
-		switch key.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		}
-	}
-
-	return m, nil
-}
-
-func (model) View() string {
-	return "Jimpachi\n\nSystem audio recorder\n\nPress q to quit.\n"
-}
-
-func main() {
-	p := tea.NewProgram(model{})
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Jimpachi failed: %v\n", err)
-		os.Exit(1)
-	}
+func fail(err error) {
+	fmt.Fprintf(os.Stderr, "Jimpachi failed: %v\n", err)
+	os.Exit(1)
 }
