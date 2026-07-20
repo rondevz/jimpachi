@@ -60,9 +60,69 @@ func (s *SQLite) initialize(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS recordings_started_at_idx
 			ON recordings (started_at_unix_ns DESC);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return fmt.Errorf("initialize Recording history database: %w", err)
+	}
+
+	return nil
+}
+
+// Setting returns a locally persisted application setting.
+func (s *SQLite) Setting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("load setting %q: %w", key, err)
+	}
+
+	return value, true, nil
+}
+
+// SaveSetting stores a locally persisted application setting.
+func (s *SQLite) SaveSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	if err != nil {
+		return fmt.Errorf("save setting %q: %w", key, err)
+	}
+
+	return nil
+}
+
+// SaveSettings stores related application settings atomically.
+func (s *SQLite) SaveSettings(ctx context.Context, settings map[string]string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin settings transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.PrepareContext(ctx, `
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare settings save: %w", err)
+	}
+	defer statement.Close()
+
+	for key, value := range settings {
+		if _, err := statement.ExecContext(ctx, key, value); err != nil {
+			return fmt.Errorf("save setting %q: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit settings transaction: %w", err)
 	}
 
 	return nil

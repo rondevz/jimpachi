@@ -67,3 +67,36 @@ func TestSQLitePersistsRecordingHistoryAcrossReopen(t *testing.T) {
 		t.Errorf("database file was not created: %v", err)
 	}
 }
+
+func TestSQLiteSaveSettingsRollsBackAllValuesWhenOneWriteFails(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := store.db.ExecContext(ctx, `
+		CREATE TRIGGER reject_audio_source_name
+		BEFORE INSERT ON settings WHEN NEW.key = 'audio_source_name'
+		BEGIN SELECT RAISE(ABORT, 'reject source name'); END;
+	`); err != nil {
+		t.Fatalf("create settings trigger error = %v", err)
+	}
+
+	err = store.SaveSettings(ctx, map[string]string{
+		"audio_source_id":       "speakers.monitor",
+		"audio_source_name":     "Speakers",
+		"audio_source_explicit": "false",
+	})
+	if err == nil {
+		t.Fatal("SaveSettings() error = nil, want transaction failure")
+	}
+	for _, key := range []string{"audio_source_id", "audio_source_name", "audio_source_explicit"} {
+		if _, found, err := store.Setting(ctx, key); err != nil {
+			t.Fatalf("Setting(%q) error = %v", key, err)
+		} else if found {
+			t.Errorf("Setting(%q) remained after failed atomic save", key)
+		}
+	}
+}
