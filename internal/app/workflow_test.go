@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"jimpachi/internal/audio"
 	"jimpachi/internal/recording"
+	"jimpachi/internal/transcription"
 )
 
 func TestOpenCreatesWorkflowWithEmptyRecordingHistory(t *testing.T) {
@@ -33,6 +35,177 @@ func TestOpenCreatesWorkflowWithEmptyRecordingHistory(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(dir, "jimpachi.db")); err != nil {
 		t.Errorf("Recording history database was not created: %v", err)
+	}
+}
+
+func TestWorkflowAutomaticallyTranscribesCompletedRecording(t *testing.T) {
+	ctx := context.Background()
+	transcriber := &fakeTranscriber{segments: []transcription.Segment{{Start: 0, End: 2 * time.Second, Text: "Deploy after lunch."}}}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, t.TempDir(), fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatalf("StopRecording() error = %v", err)
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if len(detail.Transcription) == 1 {
+			if got, want := detail.Transcription[0].Text, "Deploy after lunch."; got != want {
+				t.Errorf("Transcription text = %q, want %q", got, want)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("completed Recording was not automatically transcribed")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestWorkflowAllowsManualTranscriptionWhenAutomaticTranscriptionIsDisabled(t *testing.T) {
+	ctx := context.Background()
+	transcriber := &fakeTranscriber{segments: []transcription.Segment{{Start: time.Second, End: 2 * time.Second, Text: "Check the release."}}}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, t.TempDir(), fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SetAutomaticTranscription(ctx, false); err != nil {
+		t.Fatalf("SetAutomaticTranscription() error = %v", err)
+	}
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatalf("StopRecording() error = %v", err)
+	}
+	detail, err := workflow.Recording(ctx, completed.ID)
+	if err != nil {
+		t.Fatalf("Recording() error = %v", err)
+	}
+	if len(detail.Transcription) != 0 {
+		t.Fatalf("automatic Transcription = %#v, want none", detail.Transcription)
+	}
+	detail, err = workflow.RequestTranscription(ctx, completed.ID)
+	if err != nil {
+		t.Fatalf("RequestTranscription() error = %v", err)
+	}
+	if detail.TranscriptionStatus != recording.TranscriptionPending {
+		t.Fatalf("manual Transcription status = %q, want pending", detail.TranscriptionStatus)
+	}
+	deadline := time.After(time.Second)
+	for detail.TranscriptionStatus != recording.TranscriptionSucceeded {
+		select {
+		case <-deadline:
+			t.Fatalf("manual Transcription status = %q, want succeeded", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+		detail, err = workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+	}
+	if len(detail.Transcription) != 1 || detail.Transcription[0].Text != "Check the release." {
+		t.Errorf("manual Transcription = %#v, want saved segment", detail.Transcription)
+	}
+}
+
+func TestWorkflowCancelsAndRetainsTranscriptionBeforeStartingCapture(t *testing.T) {
+	ctx := context.Background()
+	transcriber := &blockingTranscriber{started: make(chan struct{})}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, t.TempDir(), fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatalf("StopRecording() error = %v", err)
+	}
+	<-transcriber.started
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() while Transcription runs error = %v", err)
+	}
+	detail, err := workflow.Recording(ctx, completed.ID)
+	if err != nil {
+		t.Fatalf("Recording() error = %v", err)
+	}
+	if detail.TranscriptionStatus != recording.TranscriptionPending {
+		t.Errorf("cancelled Transcription status = %q, want pending", detail.TranscriptionStatus)
+	}
+}
+
+func TestWorkflowRecoversRunningTranscriptionAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recordings", "recording-1.opus")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create recordings directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create Recording audio: %v", err)
+	}
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	if err := store.Save(ctx, recording.Recording{ID: "recording-1", Title: "Instructions", StartedAt: time.Now(), AudioPath: path, TranscriptionStatus: recording.TranscriptionRunning}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	workflow, err := OpenWithAudioAndTranscriber(ctx, dir, fakeAudio{}, &fakeTranscriber{segments: []transcription.Segment{{Text: "Recovered."}}})
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, "recording-1")
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if detail.TranscriptionStatus == recording.TranscriptionSucceeded {
+			if len(detail.Transcription) != 1 || detail.Transcription[0].Text != "Recovered." {
+				t.Errorf("recovered Transcription = %#v", detail.Transcription)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("recovered Transcription status = %q, want succeeded", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
@@ -377,7 +550,7 @@ func TestWorkflowCapturesSelectedAudioSourceAndSavesRecording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("History() error = %v", err)
 	}
-	if len(history) != 1 || history[0] != completed {
+	if len(history) != 1 || history[0].ID != completed.ID || history[0].AudioPath != completed.AudioPath {
 		t.Errorf("History() = %#v, want saved completed Recording %#v", history, completed)
 	}
 	if err := workflow.RenameRecording(ctx, completed.ID, "Deployment instructions"); err != nil {
@@ -804,6 +977,26 @@ type fakeAudio struct {
 	playableErr error
 	startErr    error
 	onStart     func(string)
+}
+
+type fakeTranscriber struct {
+	segments []transcription.Segment
+	err      error
+}
+
+func (f *fakeTranscriber) Transcribe(context.Context, string) ([]transcription.Segment, error) {
+	return f.segments, f.err
+}
+
+type blockingTranscriber struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingTranscriber) Transcribe(ctx context.Context, _ string) ([]transcription.Segment, error) {
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func (f fakeAudio) Playable(context.Context, string) (bool, error) { return f.playable, f.playableErr }

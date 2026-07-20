@@ -43,6 +43,61 @@ func TestModelShowsRecordingHistory(t *testing.T) {
 	}
 }
 
+func TestModelOpensPersistedRecordingDetailFromHistory(t *testing.T) {
+	persisted := recording.Recording{ID: "recording-1", Title: "Deployment instructions", TranscriptionStatus: recording.TranscriptionSucceeded, Transcription: []recording.Segment{{Start: time.Second, End: 2 * time.Second, Text: "Deploy now."}}}
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{persisted}}))
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, command := updated.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if command == nil {
+		t.Fatal("opening selected Recording did not request detail")
+	}
+	updated, _ = updated.Update(command())
+	if view := updated.View(); !strings.Contains(view, "Recording detail") || !strings.Contains(view, "Deploy now.") {
+		t.Errorf("View() = %q, want persisted Recording detail and Transcription", view)
+	}
+}
+
+func TestModelPollsAfterManualTranscriptionRequestIsPending(t *testing.T) {
+	pending := recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionPending}
+	model := load(t, New(context.Background(), fakeHistory{requested: &pending}))
+	model.detail = &recording.Recording{ID: pending.ID, TranscriptionStatus: recording.TranscriptionFailed}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if command == nil {
+		t.Fatal("manual Transcription did not issue a request")
+	}
+	updated, poll := updated.Update(command())
+	if poll == nil {
+		t.Fatal("pending manual Transcription did not schedule polling")
+	}
+}
+
+func TestModelShowsFullTimestampedTranscriptionInRecordingDetail(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{Title: "Instructions", Transcription: []recording.Segment{
+		{Start: time.Second, End: 3 * time.Second, Text: "Deploy the service."},
+		{Start: 4 * time.Second, End: 6 * time.Second, Text: "Verify the dashboard."},
+	}}
+	view := model.View()
+	for _, want := range []string{"Transcription", "[00:00:01 - 00:00:03] Deploy the service.", "[00:00:04 - 00:00:06] Verify the dashboard."} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() = %q, want %q", view, want)
+		}
+	}
+}
+
+func TestModelShowsFailedTranscriptionAndStopsPolling(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionFailed, TranscriptionError: "Transcription could not be completed."}
+	if view := model.View(); !strings.Contains(view, "Transcription failed: Transcription could not be completed.") || !strings.Contains(view, "Press t to retry") {
+		t.Errorf("View() = %q, want Transcription failure and retry guidance", view)
+	}
+	updated, command := model.Update(transcriptionLoaded{recording: *model.detail})
+	if command != nil {
+		t.Fatal("terminal failed Transcription scheduled another poll")
+	}
+	_ = updated
+}
+
 func TestModelShowsMissingAudioCondition(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: "Moved", AudioMissing: true}}}))
 	if !strings.Contains(model.View(), "Audio file is missing.") {
@@ -548,6 +603,7 @@ type fakeHistory struct {
 	savedLimit   *time.Duration
 	limitWrites  *[]time.Duration
 	limitErr     error
+	requested    *recording.Recording
 }
 
 func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return f.startup, nil }
@@ -587,6 +643,26 @@ func (f fakeHistory) SetRecordingLimit(_ context.Context, limit time.Duration) e
 		*f.limitWrites = append(*f.limitWrites, limit)
 	}
 	return f.limitErr
+}
+
+func (f fakeHistory) AutomaticTranscription(context.Context) (bool, error) { return true, nil }
+
+func (f fakeHistory) SetAutomaticTranscription(context.Context, bool) error { return nil }
+
+func (f fakeHistory) Recording(_ context.Context, id string) (recording.Recording, error) {
+	for _, value := range f.recordings {
+		if value.ID == id {
+			return value, nil
+		}
+	}
+	return recording.Recording{ID: id}, nil
+}
+
+func (f fakeHistory) RequestTranscription(_ context.Context, id string) (recording.Recording, error) {
+	if f.requested != nil {
+		return *f.requested, nil
+	}
+	return f.Recording(context.Background(), id)
 }
 
 func sameDurations(got, want []time.Duration) bool {
@@ -642,3 +718,15 @@ func (f blockingHistory) RecordingLimit(context.Context) (time.Duration, error) 
 }
 
 func (f blockingHistory) SetRecordingLimit(context.Context, time.Duration) error { return nil }
+
+func (f blockingHistory) AutomaticTranscription(context.Context) (bool, error) { return true, nil }
+
+func (f blockingHistory) SetAutomaticTranscription(context.Context, bool) error { return nil }
+
+func (f blockingHistory) Recording(context.Context, string) (recording.Recording, error) {
+	return recording.Recording{}, nil
+}
+
+func (f blockingHistory) RequestTranscription(context.Context, string) (recording.Recording, error) {
+	return recording.Recording{}, nil
+}

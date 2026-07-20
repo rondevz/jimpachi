@@ -14,14 +14,34 @@ import (
 
 // Recording is the persisted metadata for one system-output capture.
 type Recording struct {
-	ID               string
-	Title            string
-	StartedAt        time.Time
-	Duration         time.Duration
-	AudioPath        string
-	PendingPromotion bool
-	Interrupted      bool
-	AudioMissing     bool
+	ID                  string
+	Title               string
+	StartedAt           time.Time
+	Duration            time.Duration
+	AudioPath           string
+	PendingPromotion    bool
+	Interrupted         bool
+	AudioMissing        bool
+	Transcription       []Segment
+	TranscriptionStatus TranscriptionStatus
+	TranscriptionError  string
+}
+
+// TranscriptionStatus reports the durable state of derived local text.
+type TranscriptionStatus string
+
+const (
+	TranscriptionPending   TranscriptionStatus = "pending"
+	TranscriptionRunning   TranscriptionStatus = "running"
+	TranscriptionSucceeded TranscriptionStatus = "succeeded"
+	TranscriptionFailed    TranscriptionStatus = "failed"
+)
+
+// Segment is a timestamped span of a persisted Transcription.
+type Segment struct {
+	Start time.Duration
+	End   time.Duration
+	Text  string
 }
 
 // SQLite persists Recording history in a local SQLite database.
@@ -37,7 +57,9 @@ func OpenSQLite(ctx context.Context, dataDir string) (*SQLite, error) {
 		return nil, fmt.Errorf("create Jimpachi data directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "jimpachi.db"))
+	// The SQLite driver applies this URI option to every pooled connection.
+	// PRAGMA foreign_keys on one connection would leave others unconstrained.
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(dataDir, "jimpachi.db")+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("open Recording history database: %w", err)
 	}
@@ -67,12 +89,21 @@ func (s *SQLite) initialize(ctx context.Context) error {
 			audio_path TEXT NOT NULL,
 			pending_promotion INTEGER NOT NULL DEFAULT 0,
 			interrupted INTEGER NOT NULL DEFAULT 0
+			, transcription_status TEXT NOT NULL DEFAULT 'pending'
+			, transcription_error TEXT NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS recordings_started_at_idx
 			ON recordings (started_at_unix_ns DESC);
 		CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS transcription_segments (
+			recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+			start_ns INTEGER NOT NULL,
+			end_ns INTEGER NOT NULL,
+			text TEXT NOT NULL,
+			PRIMARY KEY (recording_id, start_ns, end_ns)
 		);
 	`)
 	if err != nil {
@@ -84,7 +115,69 @@ func (s *SQLite) initialize(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("add Recording interruption state: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN transcription_status TEXT NOT NULL DEFAULT 'pending'`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add Transcription status: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN transcription_error TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add Transcription error: %w", err)
+	}
 
+	return nil
+}
+
+// SaveTranscriptionStatus records a user-safe processing outcome for a Recording.
+func (s *SQLite) SaveTranscriptionStatus(ctx context.Context, id string, status TranscriptionStatus, userError string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET transcription_status = ?, transcription_error = ? WHERE id = ?`, status, userError, id)
+	if err != nil {
+		return fmt.Errorf("save Transcription status for Recording %q: %w", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check Transcription status for Recording %q: %w", id, err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("save Transcription status for Recording %q: not found", id)
+	}
+	return nil
+}
+
+// ResetRunningTranscriptions makes work interrupted by a prior process eligible again.
+func (s *SQLite) ResetRunningTranscriptions(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE recordings SET transcription_status = ?, transcription_error = '' WHERE transcription_status = ?`, TranscriptionPending, TranscriptionRunning); err != nil {
+		return fmt.Errorf("recover running Transcriptions: %w", err)
+	}
+	return nil
+}
+
+// SaveTranscription replaces the derived Transcription for a completed Recording.
+func (s *SQLite) SaveTranscription(ctx context.Context, id string, segments []Segment) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin Transcription save: %w", err)
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM recordings WHERE id = ?`, id).Scan(&exists); err == sql.ErrNoRows {
+		return fmt.Errorf("save Transcription for Recording %q: not found", id)
+	} else if err != nil {
+		return fmt.Errorf("check Recording %q before Transcription save: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM transcription_segments WHERE recording_id = ?`, id); err != nil {
+		return fmt.Errorf("clear Transcription for Recording %q: %w", id, err)
+	}
+	statement, err := tx.PrepareContext(ctx, `INSERT INTO transcription_segments (recording_id, start_ns, end_ns, text) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("prepare Transcription save: %w", err)
+	}
+	defer statement.Close()
+	for _, segment := range segments {
+		if _, err := statement.ExecContext(ctx, id, segment.Start.Nanoseconds(), segment.End.Nanoseconds(), segment.Text); err != nil {
+			return fmt.Errorf("save Transcription segment for Recording %q: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit Transcription save: %w", err)
+	}
 	return nil
 }
 
@@ -147,21 +240,30 @@ func (s *SQLite) SaveSettings(ctx context.Context, settings map[string]string) e
 // Save adds or updates a Recording in local history.
 func (s *SQLite) Save(ctx context.Context, recording Recording) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO recordings (id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO recordings (id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
 			started_at_unix_ns = excluded.started_at_unix_ns,
 			duration_ns = excluded.duration_ns,
 			audio_path = excluded.audio_path,
 			pending_promotion = excluded.pending_promotion,
-			interrupted = excluded.interrupted
-	`, recording.ID, recording.Title, recording.StartedAt.UnixNano(), recording.Duration.Nanoseconds(), recording.AudioPath, recording.PendingPromotion, recording.Interrupted)
+			interrupted = excluded.interrupted,
+			transcription_status = excluded.transcription_status,
+			transcription_error = excluded.transcription_error
+	`, recording.ID, recording.Title, recording.StartedAt.UnixNano(), recording.Duration.Nanoseconds(), recording.AudioPath, recording.PendingPromotion, recording.Interrupted, transcriptionStatus(recording.TranscriptionStatus), recording.TranscriptionError)
 	if err != nil {
 		return fmt.Errorf("save Recording %q: %w", recording.ID, err)
 	}
 
 	return nil
+}
+
+func transcriptionStatus(status TranscriptionStatus) TranscriptionStatus {
+	if status == "" {
+		return TranscriptionPending
+	}
+	return status
 }
 
 // Rename updates a Recording title without altering its capture metadata.
@@ -271,7 +373,7 @@ func (s *SQLite) completePromotion(ctx context.Context, id string) error {
 // History returns Recordings ordered from newest to oldest.
 func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted
+		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_error
 		FROM recordings
 		ORDER BY started_at_unix_ns DESC, id DESC
 	`)
@@ -284,7 +386,7 @@ func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	for rows.Next() {
 		var recording Recording
 		var startedAt, duration int64
-		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion, &recording.Interrupted); err != nil {
+		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion, &recording.Interrupted, &recording.TranscriptionStatus, &recording.TranscriptionError); err != nil {
 			return nil, fmt.Errorf("read Recording history: %w", err)
 		}
 
@@ -302,6 +404,44 @@ func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	}
 
 	return history, nil
+}
+
+// Recording returns one Recording and its full timestamped Transcription.
+func (s *SQLite) Recording(ctx context.Context, id string) (Recording, error) {
+	var result Recording
+	var startedAt, duration int64
+	err := s.db.QueryRowContext(ctx, `SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_error FROM recordings WHERE id = ?`, id).Scan(&result.ID, &result.Title, &startedAt, &duration, &result.AudioPath, &result.PendingPromotion, &result.Interrupted, &result.TranscriptionStatus, &result.TranscriptionError)
+	if err == sql.ErrNoRows {
+		return Recording{}, fmt.Errorf("load Recording %q: not found", id)
+	}
+	if err != nil {
+		return Recording{}, fmt.Errorf("load Recording %q: %w", id, err)
+	}
+	result.StartedAt = time.Unix(0, startedAt).UTC()
+	result.Duration = time.Duration(duration)
+	if _, err := os.Stat(result.AudioPath); os.IsNotExist(err) {
+		result.AudioMissing = true
+	} else if err != nil {
+		return Recording{}, fmt.Errorf("stat Recording audio %q: %w", result.AudioPath, err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT start_ns, end_ns, text FROM transcription_segments WHERE recording_id = ? ORDER BY start_ns, end_ns`, id)
+	if err != nil {
+		return Recording{}, fmt.Errorf("load Transcription for Recording %q: %w", id, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var start, end int64
+		var segment Segment
+		if err := rows.Scan(&start, &end, &segment.Text); err != nil {
+			return Recording{}, fmt.Errorf("read Transcription for Recording %q: %w", id, err)
+		}
+		segment.Start, segment.End = time.Duration(start), time.Duration(end)
+		result.Transcription = append(result.Transcription, segment)
+	}
+	if err := rows.Err(); err != nil {
+		return Recording{}, fmt.Errorf("iterate Transcription for Recording %q: %w", id, err)
+	}
+	return result, nil
 }
 
 // Close releases the local database connection.

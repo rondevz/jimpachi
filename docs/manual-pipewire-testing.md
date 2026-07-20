@@ -55,6 +55,15 @@ XDG_DATA_HOME="$(mktemp -d)" go run .
 - Source names render as ordinary text even if an audio server reports control characters.
 - The meter is only an activity indicator. It does not identify applications, people, or the semantic source of audio.
 
+## Local Transcription
+
+1. Configure valid local whisper.cpp executable and model paths as documented in the README.
+2. Capture a short Recording, stop it, and wait in its detail view. Confirm a full `Transcription` document appears with timestamped segments and the detected spoken language is transcribed without selecting a language.
+3. Press `p` to disable automatic transcription, capture another short Recording, and confirm it initially shows `No Transcription yet.`
+4. Press `t` in that Recording detail view and confirm the full timestamped document appears.
+5. Quit and relaunch using the same data directory. Confirm the Transcription remains visible in the Recording detail view.
+6. Temporarily configure an invalid model path, manually request transcription, and confirm the Recording remains available and the setup error is shown.
+
 ## Not Covered Here
 
-This checklist does not cover Transcription or Summaries.
+This checklist does not cover Summary generation.

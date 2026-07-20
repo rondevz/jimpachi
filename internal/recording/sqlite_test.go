@@ -67,11 +67,11 @@ func TestSQLitePersistsRecordingHistoryAcrossReopen(t *testing.T) {
 	if got, want := len(history), 2; got != want {
 		t.Fatalf("History() returned %d recordings, want %d", got, want)
 	}
-	if got, want := history[0], later; got != want {
-		t.Errorf("History()[0] = %#v, want %#v", got, want)
+	if got := history[0]; got.ID != later.ID || got.Title != later.Title || got.StartedAt != later.StartedAt || got.Duration != later.Duration || got.AudioPath != later.AudioPath {
+		t.Errorf("History()[0] = %#v, want %#v", got, later)
 	}
-	if got, want := history[1], earlier; got != want {
-		t.Errorf("History()[1] = %#v, want %#v", got, want)
+	if got := history[1]; got.ID != earlier.ID || got.Title != earlier.Title || got.StartedAt != earlier.StartedAt || got.Duration != earlier.Duration || got.AudioPath != earlier.AudioPath {
+		t.Errorf("History()[1] = %#v, want %#v", got, earlier)
 	}
 
 	if _, err := os.Stat(filepath.Join(dir, "jimpachi.db")); err != nil {
@@ -193,5 +193,79 @@ func TestSQLiteKeepsCompletedRecordingWhenAudioIsMissing(t *testing.T) {
 	}
 	if len(history) != 1 || !history[0].AudioMissing {
 		t.Errorf("History() = %#v, want completed Recording with missing-audio state", history)
+	}
+}
+
+func TestSQLitePersistsTimestampedTranscriptionSegments(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	path := filepath.Join(t.TempDir(), "recording.opus")
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create Recording audio: %v", err)
+	}
+	if err := store.Save(ctx, Recording{ID: "recording-1", Title: "Instructions", StartedAt: time.Now(), AudioPath: path}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	segments := []Segment{{Start: time.Second, End: 3 * time.Second, Text: "Deploy the service."}, {Start: 4 * time.Second, End: 6 * time.Second, Text: "Verify the dashboard."}}
+	if err := store.SaveTranscription(ctx, "recording-1", segments); err != nil {
+		t.Fatalf("SaveTranscription() error = %v", err)
+	}
+	detail, err := store.Recording(ctx, "recording-1")
+	if err != nil {
+		t.Fatalf("Recording() error = %v", err)
+	}
+	if got, want := len(detail.Transcription), 2; got != want {
+		t.Fatalf("Transcription = %#v, want two segments", detail.Transcription)
+	}
+	for index, want := range segments {
+		if got := detail.Transcription[index]; got != want {
+			t.Errorf("Transcription[%d] = %#v, want %#v", index, got, want)
+		}
+	}
+}
+
+func TestSQLiteTracksTranscriptionStatusAndEnforcesSegmentParent(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveTranscription(ctx, "missing", nil); err == nil {
+		t.Fatal("SaveTranscription() error = nil, want missing Recording rejection")
+	}
+	path := filepath.Join(t.TempDir(), "recording.opus")
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create Recording audio: %v", err)
+	}
+	if err := store.Save(ctx, Recording{ID: "recording-1", Title: "Instructions", StartedAt: time.Now(), AudioPath: path}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.SaveTranscriptionStatus(ctx, "recording-1", TranscriptionFailed, "Transcription could not be completed."); err != nil {
+		t.Fatalf("SaveTranscriptionStatus() error = %v", err)
+	}
+	if err := store.SaveTranscription(ctx, "recording-1", []Segment{{Text: "Deploy."}}); err != nil {
+		t.Fatalf("SaveTranscription() error = %v", err)
+	}
+	detail, err := store.Recording(ctx, "recording-1")
+	if err != nil {
+		t.Fatalf("Recording() error = %v", err)
+	}
+	if detail.TranscriptionStatus != TranscriptionFailed || detail.TranscriptionError != "Transcription could not be completed." {
+		t.Errorf("Recording() Transcription state = %q, %q", detail.TranscriptionStatus, detail.TranscriptionError)
+	}
+	if err := store.Delete(ctx, "recording-1"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	var remaining int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM transcription_segments`).Scan(&remaining); err != nil {
+		t.Fatalf("count segments: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("segments after Recording deletion = %d, want 0", remaining)
 	}
 }

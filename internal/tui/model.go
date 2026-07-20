@@ -26,6 +26,10 @@ type Workflow interface {
 	CaptureState() app.CaptureState
 	RecordingLimit(context.Context) (time.Duration, error)
 	SetRecordingLimit(context.Context, time.Duration) error
+	AutomaticTranscription(context.Context) (bool, error)
+	SetAutomaticTranscription(context.Context, bool) error
+	Recording(context.Context, string) (recording.Recording, error)
+	RequestTranscription(context.Context, string) (recording.Recording, error)
 }
 
 // Model renders Jimpachi's Recording history.
@@ -60,6 +64,10 @@ type Model struct {
 	limitSaving     bool
 	savingLimit     time.Duration
 	warning         string
+	transcribing    bool
+	automatic       bool
+	historyFocused  bool
+	historyIndex    int
 }
 
 // New creates a terminal model backed by Recording history.
@@ -74,7 +82,8 @@ func (m Model) Init() tea.Cmd {
 		recordings, historyErr := m.workflow.History(m.ctx)
 		sources, audioErr := m.workflow.AudioSources(m.ctx)
 		limit, limitErr := m.workflow.RecordingLimit(m.ctx)
-		return initialLoaded{startup: startup, startupErr: startupErr, recordings: recordings, historyErr: historyErr, audio: sources, audioErr: audioErr, limit: limit, limitErr: limitErr}
+		automatic, automaticErr := m.workflow.AutomaticTranscription(m.ctx)
+		return initialLoaded{startup: startup, startupErr: startupErr, recordings: recordings, historyErr: historyErr, audio: sources, audioErr: audioErr, limit: limit, limitErr: limitErr, automatic: automatic, automaticErr: automaticErr}
 	}
 }
 
@@ -92,6 +101,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.canUsePath = message.audio.CanUseExplicitPath
 		m.recordingLimit = message.limit
 		m.persistedLimit = message.limit
+		m.automatic = message.automatic
 		for index, source := range m.sources {
 			if source.ID == m.selected.ID {
 				m.sourceIndex = index
@@ -107,6 +117,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if message.limitErr != nil && m.err == nil {
 			m.err = message.limitErr
+		}
+		if message.automaticErr != nil && m.err == nil {
+			m.err = message.automaticErr
 		}
 		return m, m.activityCommand()
 	case recordingLimitSaved:
@@ -208,6 +221,44 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail = &message.recording
 		m.recordings = append([]recording.Recording{message.recording}, m.recordings...)
+		return m, m.transcriptionTick()
+	case transcriptionLoaded:
+		if m.detail == nil || m.detail.ID != message.recording.ID {
+			return m, nil
+		}
+		if message.err == nil {
+			m.detail = &message.recording
+		}
+		if (m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning) && !m.transcribing {
+			return m, m.transcriptionTick()
+		}
+		return m, nil
+	case transcriptionRequested:
+		m.transcribing = false
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.detail = &message.recording
+		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning {
+			return m, m.transcriptionTick()
+		}
+		return m, nil
+	case recordingOpened:
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.detail = &message.recording
+		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning {
+			return m, m.transcriptionTick()
+		}
+		return m, nil
+	case automaticTranscriptionSaved:
+		if message.err != nil {
+			m.automatic = !message.enabled
+			m.err = message.err
+		}
 		return m, nil
 	case recordingTick:
 		state := m.workflow.CaptureState()
@@ -217,7 +268,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.warning = ""
 			m.detail = state.Completed
 			m.recordings = append([]recording.Recording{*state.Completed}, m.recordings...)
-			return m, nil
+			return m, m.transcriptionTick()
 		}
 		m.warning = state.Warning
 		if state.Failure != "" {
@@ -323,24 +374,45 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.editingTitle = true
 				m.title = m.detail.Title
 			}
+		case "t":
+			if m.detail != nil && !m.transcribing {
+				m.transcribing = true
+				return m, m.requestTranscription(m.detail.ID)
+			}
+		case "p":
+			if m.active == nil && !m.startPending && !m.stopPending {
+				m.automatic = !m.automatic
+				return m, m.setAutomaticTranscription(m.automatic)
+			}
 		case "esc":
 			m.detail = nil
+			m.historyFocused = true
+		case "tab":
+			if m.detail == nil && len(m.recordings) > 0 {
+				m.historyFocused = !m.historyFocused
+			}
 		case "up", "k":
-			if m.active == nil && m.sourceIndex > 0 {
+			if m.historyFocused && m.historyIndex > 0 {
+				m.historyIndex--
+			} else if m.active == nil && m.sourceIndex > 0 {
 				m.sourceIndex--
 				m.generation++
 				m.clearActivity()
 				return m, m.activityCommand()
 			}
 		case "down", "j":
-			if m.active == nil && m.sourceIndex+1 < len(m.sources) {
+			if m.historyFocused && m.historyIndex+1 < len(m.recordings) {
+				m.historyIndex++
+			} else if m.active == nil && m.sourceIndex+1 < len(m.sources) {
 				m.sourceIndex++
 				m.generation++
 				m.clearActivity()
 				return m, m.activityCommand()
 			}
 		case "enter":
-			if m.active == nil && len(m.sources) > 0 {
+			if m.historyFocused && len(m.recordings) > 0 {
+				return m, m.openRecording(m.recordings[m.historyIndex].ID)
+			} else if m.active == nil && len(m.sources) > 0 {
 				m.confirmation++
 				m.generation++
 				m.clearActivity()
@@ -426,6 +498,11 @@ func (m Model) View() string {
 	} else {
 		fmt.Fprintf(&view, "Recording limit: %s. Press [ or ] to adjust; l disables.\n\n", m.recordingLimit)
 	}
+	if m.automatic {
+		view.WriteString("Automatic transcription: enabled. Press p to disable.\n\n")
+	} else {
+		view.WriteString("Automatic transcription: disabled. Press p to enable.\n\n")
+	}
 	if m.detail != nil {
 		view.WriteString("Recording detail\n\n")
 		if m.editingTitle {
@@ -440,7 +517,31 @@ func (m Model) View() string {
 			if m.detail.Interrupted {
 				view.WriteString("Interrupted capture recovered after restart.\n")
 			}
-			view.WriteString("Press e to edit title; esc returns to history.\n")
+			view.WriteString("\nTranscription\n\n")
+			switch m.detail.TranscriptionStatus {
+			case recording.TranscriptionPending:
+				view.WriteString("Transcription is pending.\n")
+			case recording.TranscriptionRunning:
+				view.WriteString("Transcription in progress.\n")
+			case recording.TranscriptionFailed:
+				fmt.Fprintf(&view, "Transcription failed: %s\n", terminalText(m.detail.TranscriptionError))
+			case recording.TranscriptionSucceeded:
+				if len(m.detail.Transcription) == 0 {
+					view.WriteString("No speech was detected.\n")
+				}
+			default:
+				view.WriteString("No Transcription yet.\n")
+			}
+			if len(m.detail.Transcription) > 0 {
+				for _, segment := range m.detail.Transcription {
+					fmt.Fprintf(&view, "[%s - %s] %s\n", formatTimestamp(segment.Start), formatTimestamp(segment.End), terminalText(segment.Text))
+				}
+			}
+			if m.detail.TranscriptionStatus == recording.TranscriptionFailed {
+				view.WriteString("\nPress t to retry; e to edit title; esc returns to history.\n")
+			} else {
+				view.WriteString("\nPress t to transcribe; e to edit title; esc returns to history.\n")
+			}
 		}
 		return view.String()
 	}
@@ -455,8 +556,12 @@ func (m Model) View() string {
 		return view.String()
 	}
 
-	for _, recording := range m.recordings {
-		fmt.Fprintf(&view, "%s\n", terminalText(recording.Title))
+	for index, recording := range m.recordings {
+		prefix := "  "
+		if m.historyFocused && index == m.historyIndex {
+			prefix = "> "
+		}
+		fmt.Fprintf(&view, "%s%s\n", prefix, terminalText(recording.Title))
 		fmt.Fprintf(&view, "%s  %s\n\n", recording.StartedAt.Local().Format("2006-01-02 15:04"), recording.Duration.Round(1e9))
 		if recording.AudioMissing {
 			view.WriteString("Audio file is missing.\n\n")
@@ -465,19 +570,22 @@ func (m Model) View() string {
 			view.WriteString("Interrupted capture recovered after restart.\n\n")
 		}
 	}
+	view.WriteString("Press tab to focus history; up/down and enter open a Recording.\n")
 
 	return view.String()
 }
 
 type initialLoaded struct {
-	recordings []recording.Recording
-	historyErr error
-	startup    app.Startup
-	startupErr error
-	audio      app.AudioState
-	audioErr   error
-	limit      time.Duration
-	limitErr   error
+	recordings   []recording.Recording
+	historyErr   error
+	startup      app.Startup
+	startupErr   error
+	audio        app.AudioState
+	audioErr     error
+	limit        time.Duration
+	limitErr     error
+	automatic    bool
+	automaticErr error
 }
 
 type sourceActivity struct {
@@ -514,6 +622,22 @@ type recordingRenamed struct {
 type recordingLimitSaved struct {
 	limit time.Duration
 	err   error
+}
+type transcriptionLoaded struct {
+	recording recording.Recording
+	err       error
+}
+type transcriptionRequested struct {
+	recording recording.Recording
+	err       error
+}
+type automaticTranscriptionSaved struct {
+	enabled bool
+	err     error
+}
+type recordingOpened struct {
+	recording recording.Recording
+	err       error
 }
 
 func (m Model) activityCommand() tea.Cmd {
@@ -553,6 +677,37 @@ func (m Model) renameRecording(id, title string) tea.Cmd {
 	return func() tea.Msg {
 		err := m.workflow.RenameRecording(m.ctx, id, title)
 		return recordingRenamed{id: id, title: title, err: err}
+	}
+}
+
+func (m Model) transcriptionTick() tea.Cmd {
+	if m.detail == nil {
+		return nil
+	}
+	id := m.detail.ID
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		recording, err := m.workflow.Recording(m.ctx, id)
+		return transcriptionLoaded{recording: recording, err: err}
+	})
+}
+
+func (m Model) requestTranscription(id string) tea.Cmd {
+	return func() tea.Msg {
+		recording, err := m.workflow.RequestTranscription(m.ctx, id)
+		return transcriptionRequested{recording: recording, err: err}
+	}
+}
+
+func (m Model) openRecording(id string) tea.Cmd {
+	return func() tea.Msg {
+		recording, err := m.workflow.Recording(m.ctx, id)
+		return recordingOpened{recording: recording, err: err}
+	}
+}
+
+func (m Model) setAutomaticTranscription(enabled bool) tea.Cmd {
+	return func() tea.Msg {
+		return automaticTranscriptionSaved{enabled: enabled, err: m.workflow.SetAutomaticTranscription(m.ctx, enabled)}
 	}
 }
 
@@ -631,4 +786,8 @@ func terminalText(text string) string {
 		}
 		return character
 	}, sanitized.String())
+}
+
+func formatTimestamp(value time.Duration) string {
+	return fmt.Sprintf("%02d:%02d:%02d", int(value.Hours()), int(value.Minutes())%60, int(value.Seconds())%60)
 }

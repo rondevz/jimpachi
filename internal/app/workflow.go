@@ -13,13 +13,15 @@ import (
 
 	"jimpachi/internal/audio"
 	"jimpachi/internal/recording"
+	"jimpachi/internal/transcription"
 )
 
 // Workflow coordinates Jimpachi behavior for the terminal UI.
 type Workflow struct {
-	history   *recording.SQLite
-	audio     audio.Adapter
-	scheduler Scheduler
+	history     *recording.SQLite
+	audio       audio.Adapter
+	transcriber Transcriber
+	scheduler   Scheduler
 
 	audioSourceMu            sync.Mutex
 	latestAudioSourceVersion uint64
@@ -29,6 +31,19 @@ type Workflow struct {
 	captureCompleted         *recording.Recording
 	recoveryWarning          string
 	limitStopTimeout         time.Duration
+	processingMu             sync.Mutex
+	workerCancel             context.CancelFunc
+	workerWake               chan struct{}
+	workerWG                 sync.WaitGroup
+	pendingTranscription     *recording.Recording
+	runningCancel            context.CancelFunc
+	runningDone              chan struct{}
+	processingPaused         bool
+}
+
+// Transcriber is the external local speech-to-text boundary used by Workflow.
+type Transcriber interface {
+	Transcribe(context.Context, string) ([]transcription.Segment, error)
 }
 
 type activeRecording struct {
@@ -81,11 +96,24 @@ func Open(ctx context.Context, dataDir string) (*Workflow, error) {
 
 // OpenWithAudio creates a workflow using an operating-system audio adapter.
 func OpenWithAudio(ctx context.Context, dataDir string, adapter audio.Adapter) (*Workflow, error) {
-	return OpenWithAudioAndScheduler(ctx, dataDir, adapter, realScheduler{})
+	whisper, err := transcription.LoadConfiguredWhisper()
+	if err != nil {
+		return nil, err
+	}
+	return OpenWithAudioAndTranscriber(ctx, dataDir, adapter, whisper)
+}
+
+// OpenWithAudioAndTranscriber creates a workflow with replaceable local transcription.
+func OpenWithAudioAndTranscriber(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber) (*Workflow, error) {
+	return open(ctx, dataDir, adapter, transcriber, realScheduler{})
 }
 
 // OpenWithAudioAndScheduler creates a workflow with a controllable time seam.
 func OpenWithAudioAndScheduler(ctx context.Context, dataDir string, adapter audio.Adapter, scheduler Scheduler) (*Workflow, error) {
+	return open(ctx, dataDir, adapter, transcription.Whisper{}, scheduler)
+}
+
+func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber, scheduler Scheduler) (*Workflow, error) {
 	history, err := recording.OpenSQLite(ctx, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open application workflow: %w", err)
@@ -95,7 +123,31 @@ func OpenWithAudioAndScheduler(ctx context.Context, dataDir string, adapter audi
 		_ = history.Close()
 		return nil, fmt.Errorf("recover interrupted Recordings: %w", err)
 	}
-	return &Workflow{history: history, audio: adapter, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second}, nil
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
+	workflow.workerWG.Add(1)
+	go workflow.runTranscriptionWorker(workerCtx)
+	if err := history.ResetRunningTranscriptions(ctx); err != nil {
+		_ = workflow.Close()
+		return nil, fmt.Errorf("recover running Transcriptions: %w", err)
+	}
+	if enabled, err := workflow.AutomaticTranscription(ctx); err != nil {
+		_ = workflow.Close()
+		return nil, err
+	} else if enabled {
+		pending, err := workflow.nextPendingTranscription(ctx)
+		if err != nil {
+			_ = workflow.Close()
+			return nil, err
+		}
+		if pending != nil {
+			if err := workflow.enqueueTranscription(ctx, *pending); err != nil {
+				_ = workflow.Close()
+				return nil, err
+			}
+		}
+	}
+	return workflow, nil
 }
 
 // DataDir returns the XDG data directory for Jimpachi.
@@ -274,6 +326,20 @@ func (w *Workflow) SetRecordingLimit(ctx context.Context, limit time.Duration) e
 
 // StartRecording begins capture from the persisted Audio source.
 func (w *Workflow) StartRecording(ctx context.Context) (ActiveRecording, error) {
+	w.pauseTranscription()
+	captureStarted := false
+	defer func() {
+		if captureStarted {
+			return
+		}
+		w.recordingMu.Lock()
+		active := w.activeRecording != nil
+		w.recordingMu.Unlock()
+		if !active {
+			w.resumeTranscription()
+		}
+	}()
+	w.cancelAndAwaitTranscription()
 	w.recordingMu.Lock()
 	defer w.recordingMu.Unlock()
 	if w.activeRecording != nil {
@@ -327,6 +393,7 @@ func (w *Workflow) StartRecording(ctx context.Context) (ActiveRecording, error) 
 		active.limit = w.scheduler.AfterFunc(limit, func() { w.stopAtLimit(active) })
 	}
 	go w.watchCapture(active)
+	captureStarted = true
 	return ActiveRecording{ID: id, StartedAt: startedAt, Source: state.Selected}, nil
 }
 
@@ -392,7 +459,173 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 		w.captureCompleted = &active.recording
 	}
 	w.recordingMu.Unlock()
-	return active.recording, nil
+	completed := active.recording
+	w.resumeTranscription()
+	if enabled, err := w.AutomaticTranscription(ctx); err == nil && enabled {
+		_ = w.enqueueTranscription(ctx, completed)
+	}
+	return completed, nil
+}
+
+// AutomaticTranscription reports whether completed Recordings are transcribed automatically.
+func (w *Workflow) AutomaticTranscription(ctx context.Context) (bool, error) {
+	value, found, err := w.history.Setting(ctx, "automatic_transcription")
+	if err != nil {
+		return false, fmt.Errorf("load automatic Transcription setting: %w", err)
+	}
+	return !found || value == "true", nil
+}
+
+// SetAutomaticTranscription persists whether completed Recordings are transcribed automatically.
+func (w *Workflow) SetAutomaticTranscription(ctx context.Context, enabled bool) error {
+	if err := w.history.SaveSetting(ctx, "automatic_transcription", strconv.FormatBool(enabled)); err != nil {
+		return fmt.Errorf("save automatic Transcription setting: %w", err)
+	}
+	return nil
+}
+
+// RequestTranscription manually creates or replaces a completed Recording's Transcription.
+func (w *Workflow) RequestTranscription(ctx context.Context, id string) (recording.Recording, error) {
+	detail, err := w.history.Recording(ctx, id)
+	if err != nil {
+		return recording.Recording{}, fmt.Errorf("load Recording for Transcription: %w", err)
+	}
+	if detail.PendingPromotion || detail.Interrupted || detail.AudioMissing {
+		return recording.Recording{}, fmt.Errorf("request Transcription: Recording audio is not completed")
+	}
+	if err := w.enqueueTranscription(ctx, detail); err != nil {
+		return recording.Recording{}, err
+	}
+	return w.Recording(ctx, id)
+}
+
+// Recording returns a detail view including its full timestamped Transcription.
+func (w *Workflow) Recording(ctx context.Context, id string) (recording.Recording, error) {
+	detail, err := w.history.Recording(ctx, id)
+	if err != nil {
+		return recording.Recording{}, fmt.Errorf("load workflow Recording: %w", err)
+	}
+	return detail, nil
+}
+
+func (w *Workflow) enqueueTranscription(ctx context.Context, completed recording.Recording) error {
+	if err := w.history.SaveTranscriptionStatus(ctx, completed.ID, recording.TranscriptionPending, ""); err != nil {
+		return fmt.Errorf("queue Transcription for Recording %q: %w", completed.ID, err)
+	}
+	w.processingMu.Lock()
+	w.pendingTranscription = &completed
+	if w.runningCancel != nil {
+		w.runningCancel()
+	}
+	w.processingMu.Unlock()
+	w.wakeTranscriptionWorker()
+	return nil
+}
+
+func (w *Workflow) nextPendingTranscription(ctx context.Context) (*recording.Recording, error) {
+	history, err := w.history.History(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load pending Transcriptions: %w", err)
+	}
+	for _, completed := range history {
+		if completed.TranscriptionStatus == recording.TranscriptionPending && !completed.PendingPromotion && !completed.Interrupted && !completed.AudioMissing {
+			return &completed, nil
+		}
+	}
+	return nil, nil
+}
+
+func (w *Workflow) transcribe(ctx context.Context, completed recording.Recording) error {
+	segments, err := w.transcriber.Transcribe(ctx, completed.AudioPath)
+	if err != nil {
+		return fmt.Errorf("transcribe Recording %q: %w", completed.ID, err)
+	}
+	persisted := make([]recording.Segment, len(segments))
+	for index, segment := range segments {
+		persisted[index] = recording.Segment{Start: segment.Start, End: segment.End, Text: segment.Text}
+	}
+	if err := w.history.SaveTranscription(ctx, completed.ID, persisted); err != nil {
+		return fmt.Errorf("save Transcription for Recording %q: %w", completed.ID, err)
+	}
+	return nil
+}
+
+func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
+	defer w.workerWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.workerWake:
+		}
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			w.processingMu.Lock()
+			if w.pendingTranscription == nil || w.processingPaused {
+				w.processingMu.Unlock()
+				break
+			}
+			completed := *w.pendingTranscription
+			w.pendingTranscription = nil
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			w.runningCancel, w.runningDone = cancel, done
+			w.processingMu.Unlock()
+
+			_ = w.history.SaveTranscriptionStatus(runCtx, completed.ID, recording.TranscriptionRunning, "")
+			err := w.transcribe(runCtx, completed)
+			if runCtx.Err() != nil {
+				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionPending, "")
+			} else if err != nil {
+				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionFailed, "Transcription could not be completed. Check the local whisper.cpp setup and try again.")
+			} else {
+				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionSucceeded, "")
+			}
+			cancel()
+			w.processingMu.Lock()
+			w.runningCancel, w.runningDone = nil, nil
+			close(done)
+			hasPending := w.pendingTranscription != nil
+			w.processingMu.Unlock()
+			if !hasPending {
+				break
+			}
+		}
+	}
+}
+
+func (w *Workflow) wakeTranscriptionWorker() {
+	select {
+	case w.workerWake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *Workflow) pauseTranscription() {
+	w.processingMu.Lock()
+	w.processingPaused = true
+	w.processingMu.Unlock()
+}
+
+func (w *Workflow) resumeTranscription() {
+	w.processingMu.Lock()
+	w.processingPaused = false
+	w.processingMu.Unlock()
+	w.wakeTranscriptionWorker()
+}
+
+func (w *Workflow) cancelAndAwaitTranscription() {
+	w.processingMu.Lock()
+	cancel, done := w.runningCancel, w.runningDone
+	if cancel != nil {
+		cancel()
+	}
+	w.processingMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // CaptureState returns state that the UI can poll while a Recording is active.
@@ -497,6 +730,10 @@ func (w *Workflow) RenameRecording(ctx context.Context, id, title string) error 
 
 // Close releases the workflow's local resources.
 func (w *Workflow) Close() error {
+	w.cancelAndAwaitTranscription()
+	w.workerCancel()
+	w.wakeTranscriptionWorker()
+	w.workerWG.Wait()
 	w.recordingMu.Lock()
 	if w.activeRecording != nil {
 		active := w.activeRecording
