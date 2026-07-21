@@ -70,7 +70,7 @@ func TestSourcesExplainsHowToRecoverWhenNoActivityMeterIsAvailable(t *testing.T)
 	}
 }
 
-func TestPipeWireSourcesFallsBackToOutputSinks(t *testing.T) {
+func TestPipeWireSourcesRejectsOutputSinksWithoutMonitor(t *testing.T) {
 	sources, err := pipeWireSources(context.Background(), func(context.Context, string, ...string) ([]byte, error) {
 		return []byte(`[
 			{"info":{"props":{"media.class":"Audio/Source","node.name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}}},
@@ -80,8 +80,8 @@ func TestPipeWireSourcesFallsBackToOutputSinks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pipeWireSources() error = %v", err)
 	}
-	if len(sources) != 1 || sources[0] != (Source{ID: "bluez_output.80_0A_E5_B4_42_00.1", Name: "Cubitt Headphones"}) {
-		t.Errorf("pipeWireSources() = %#v, want direct output sink", sources)
+	if len(sources) != 0 {
+		t.Errorf("pipeWireSources() = %#v, want no system-output monitor", sources)
 	}
 }
 

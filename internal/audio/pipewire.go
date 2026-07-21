@@ -101,7 +101,6 @@ func pipeWireSources(ctx context.Context, run outputRunner) ([]Source, error) {
 	}
 
 	var monitors []Source
-	var sinks []Source
 	for _, object := range objects {
 		props := object.Info.Props
 		mediaClass, _ := props["media.class"].(string)
@@ -116,17 +115,9 @@ func pipeWireSources(ctx context.Context, run outputRunner) ([]Source, error) {
 		if mediaClass == "Audio/Source" && strings.HasSuffix(id, ".monitor") {
 			monitors = append(monitors, Source{ID: id, Name: name})
 		}
-		if mediaClass == "Audio/Sink" {
-			sinks = append(sinks, Source{ID: id, Name: name})
-		}
 	}
 
-	if len(monitors) > 0 {
-		return monitors, nil
-	}
-	// Some PipeWire sessions, including Bluetooth-only output setups, expose no
-	// PulseAudio-style monitor node. pw-cat can record their output sink directly.
-	return sinks, nil
+	return monitors, nil
 }
 
 func pulseSources(ctx context.Context, run outputRunner) ([]Source, error) {
