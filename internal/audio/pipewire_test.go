@@ -85,6 +85,16 @@ func TestPipeWireSourcesRejectsOutputSinksWithoutMonitor(t *testing.T) {
 	}
 }
 
+func TestValidateSystemOutputSourceRejectsSavedOutputSink(t *testing.T) {
+	adapter := pipeWire{run: func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(`[{"info":{"props":{"media.class":"Audio/Sink","node.name":"bluez_output.80_0A_E5_B4_42_00.1"}}}]`), nil
+	}}
+	err := adapter.validateSystemOutputSource(context.Background(), Source{ID: "bluez_output.80_0A_E5_B4_42_00.1"})
+	if err == nil || !strings.Contains(err.Error(), "not a system-output monitor") {
+		t.Errorf("validateSystemOutputSource() error = %v, want unsafe sink rejection", err)
+	}
+}
+
 func TestPlayableBoundsFFprobeWithTimeout(t *testing.T) {
 	adapter := pipeWire{
 		lookPath: func(string) error { return nil },

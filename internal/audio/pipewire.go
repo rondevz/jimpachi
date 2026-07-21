@@ -139,8 +139,8 @@ func pulseSources(ctx context.Context, run outputRunner) ([]Source, error) {
 }
 
 func (p pipeWire) Activity(ctx context.Context, source Source) (float64, error) {
-	if source.ID == "" {
-		return 0, fmt.Errorf("Audio source path is required")
+	if err := p.validateSystemOutputSource(ctx, source); err != nil {
+		return 0, err
 	}
 	if p.lookPath("pw-cat") == nil {
 		level, pipeWireErr := activity(ctx, "pw-cat", "--record", "--target", source.ID, "--format", "s16", "--rate", "48000", "--channels", "1", "-")
@@ -157,11 +157,11 @@ func (p pipeWire) Activity(ctx context.Context, source Source) (float64, error) 
 // Start captures a monitor as raw PCM and gives FFmpeg sole responsibility for
 // encoding the final, portable mono Opus file.
 func (p pipeWire) Start(ctx context.Context, source Source, path string) (Capture, error) {
-	if source.ID == "" {
-		return nil, fmt.Errorf("start Audio capture: source path is required")
-	}
 	if err := p.lookPath("ffmpeg"); err != nil {
 		return nil, fmt.Errorf("start Audio capture: ffmpeg is unavailable: %w", err)
+	}
+	if err := p.validateSystemOutputSource(ctx, source); err != nil {
+		return nil, fmt.Errorf("start Audio capture: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create Recording directory: %w", err)
@@ -205,6 +205,22 @@ func (p pipeWire) Start(ctx context.Context, source Source, path string) (Captur
 	capture := &processCapture{cancelInput: cancelInput, cancelEncoder: cancelEncoder, input: input, encoder: encoder, stdout: stdout, encoderOutput: encoderOutput, done: make(chan struct{})}
 	go capture.supervise()
 	return capture, nil
+}
+
+func (p pipeWire) validateSystemOutputSource(ctx context.Context, source Source) error {
+	if source.ID == "" {
+		return fmt.Errorf("Audio source path is required")
+	}
+	sources, err := pipeWireSources(ctx, p.discovery)
+	if err != nil {
+		return fmt.Errorf("validate system-output source: %w", err)
+	}
+	for _, candidate := range sources {
+		if candidate.ID == source.ID {
+			return nil
+		}
+	}
+	return fmt.Errorf("Audio source %q is not a system-output monitor", source.ID)
 }
 
 // Playable reports whether FFmpeg can decode captured audio left by an interrupted process.
