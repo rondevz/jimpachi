@@ -211,7 +211,7 @@ func (p pipeWire) validateSystemOutputSource(ctx context.Context, source Source)
 	if source.ID == "" {
 		return fmt.Errorf("Audio source path is required")
 	}
-	sources, err := pipeWireSources(ctx, p.discovery)
+	sources, err := p.Sources(ctx)
 	if err != nil {
 		return fmt.Errorf("validate system-output source: %w", err)
 	}

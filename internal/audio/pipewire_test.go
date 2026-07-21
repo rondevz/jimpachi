@@ -86,12 +86,33 @@ func TestPipeWireSourcesRejectsOutputSinksWithoutMonitor(t *testing.T) {
 }
 
 func TestValidateSystemOutputSourceRejectsSavedOutputSink(t *testing.T) {
-	adapter := pipeWire{run: func(context.Context, string, ...string) ([]byte, error) {
-		return []byte(`[{"info":{"props":{"media.class":"Audio/Sink","node.name":"bluez_output.80_0A_E5_B4_42_00.1"}}}]`), nil
-	}}
+	adapter := pipeWire{
+		lookPath: func(string) error { return nil },
+		run: func(_ context.Context, command string, _ ...string) ([]byte, error) {
+			if command == "pw-dump" {
+				return []byte(`[{"info":{"props":{"media.class":"Audio/Sink","node.name":"bluez_output.80_0A_E5_B4_42_00.1"}}}]`), nil
+			}
+			return []byte(""), nil
+		},
+	}
 	err := adapter.validateSystemOutputSource(context.Background(), Source{ID: "bluez_output.80_0A_E5_B4_42_00.1"})
-	if err == nil || !strings.Contains(err.Error(), "not a system-output monitor") {
+	if err == nil || !strings.Contains(err.Error(), "no system-output monitors") {
 		t.Errorf("validateSystemOutputSource() error = %v, want unsafe sink rejection", err)
+	}
+}
+
+func TestValidateSystemOutputSourceAcceptsPulseAudioMonitorFallback(t *testing.T) {
+	adapter := pipeWire{
+		lookPath: func(string) error { return nil },
+		run: func(_ context.Context, command string, _ ...string) ([]byte, error) {
+			if command == "pw-dump" {
+				return []byte(`[]`), nil
+			}
+			return []byte("1355\tbluez_output.80_0A_E5_B4_42_00.1.monitor\tPipeWire\n"), nil
+		},
+	}
+	if err := adapter.validateSystemOutputSource(context.Background(), Source{ID: "bluez_output.80_0A_E5_B4_42_00.1.monitor"}); err != nil {
+		t.Fatalf("validateSystemOutputSource() error = %v", err)
 	}
 }
 
