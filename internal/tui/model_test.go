@@ -56,6 +56,12 @@ func TestModelShowsSettingsValidationFeedback(t *testing.T) {
 	}
 }
 
+func TestMeterShowsQuietNonZeroAudioActivity(t *testing.T) {
+	if got, want := meter(0.01), "[#---------]"; got != want {
+		t.Errorf("meter(0.01) = %q, want %q", got, want)
+	}
+}
+
 func TestModelRequiresConfirmationBeforeDeletingRecording(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 	model.detail = &recording.Recording{ID: "recording-1", Title: "Instructions"}
@@ -417,7 +423,7 @@ func TestModelLetsUserSelectAudioSourceAndShowsItsActivity(t *testing.T) {
 		model = updated.(Model)
 	}
 
-	if !strings.Contains(model.View(), "> Headphones [######----]") {
+	if !strings.Contains(model.View(), "> Headphones [#######---]") {
 		t.Errorf("View() = %q, want highlighted source and activity meter", model.View())
 	}
 }
@@ -431,10 +437,10 @@ func TestModelShowsActivityOnlyForHighlightedAudioSource(t *testing.T) {
 	updated, _ = updated.Update(command())
 	model = updated.(Model)
 	view := model.View()
-	if strings.Contains(view, "  Speakers [######----]") {
+	if strings.Contains(view, "  Speakers [#######---]") {
 		t.Errorf("View() = %q, rendered headphone activity for unhighlighted speakers", view)
 	}
-	if !strings.Contains(view, "> Headphones [######----]") {
+	if !strings.Contains(view, "> Headphones [#######---]") {
 		t.Errorf("View() = %q, want highlighted headphone activity", view)
 	}
 }
@@ -476,7 +482,7 @@ func TestModelClearsActivityWhenHighlightedAudioSourceChanges(t *testing.T) {
 	model = updated.(Model)
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model = updated.(Model)
-	if strings.Contains(model.View(), "> Headphones [######----]") {
+	if strings.Contains(model.View(), "> Headphones [#######---]") {
 		t.Errorf("View() = %q, rendered prior source activity for a newly highlighted source", model.View())
 	}
 }
@@ -489,12 +495,12 @@ func TestModelClearsActivityWhenAudioSourceConfirmationStartsAndCompletes(t *tes
 	model = updated.(Model)
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if strings.Contains(model.View(), "[######----]") {
+	if strings.Contains(model.View(), "[#######---]") {
 		t.Errorf("View() = %q, retained activity while source confirmation was pending", model.View())
 	}
 	updated, _ = model.Update(command())
 	model = updated.(Model)
-	if strings.Contains(model.View(), "[######----]") {
+	if strings.Contains(model.View(), "[#######---]") {
 		t.Errorf("View() = %q, retained activity after source confirmation", model.View())
 	}
 }
@@ -509,7 +515,7 @@ func TestModelKeepsConfirmedExplicitAudioSourceVisibleAndMetered(t *testing.T) {
 	}
 	updated, _ = updated.Update(command())
 	model = updated.(Model)
-	if !strings.Contains(model.View(), "> manual.monitor [####------]") {
+	if !strings.Contains(model.View(), "> manual.monitor [######----]") {
 		t.Errorf("View() = %q, want confirmed explicit source and its activity meter", model.View())
 	}
 }

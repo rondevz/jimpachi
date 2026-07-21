@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -1116,7 +1117,9 @@ func (m *Model) clearActivity() {
 }
 
 func meter(activity float64) string {
-	filled := int(activity * 10)
+	// RMS audio levels are typically far below 1.0; perceptual compression keeps
+	// quiet but real system output visible without changing capture behavior.
+	filled := int(math.Sqrt(activity) * 10)
 	if filled > 10 {
 		filled = 10
 	}
