@@ -99,8 +99,10 @@ func (w Whisper) Transcribe(ctx context.Context, audioPath string) ([]Segment, e
 	// whisper.cpp writes JSON to <output-base>.json, not stdout. -l auto preserves
 	// its language detection instead of forcing the user's interface language.
 	command := exec.CommandContext(ctx, w.Executable, "-m", w.Model, "-f", audioPath, "-of", outputBase, "-oj", "-l", "auto", "-t", fmt.Sprint(threads))
-	if output, err := command.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("run whisper.cpp: %w: %s", err, strings.TrimSpace(string(output)))
+	// Discard tool output: it can contain transcription text or local paths, neither
+	// of which belongs in a user-visible error or a warning/error log.
+	if err := command.Run(); err != nil {
+		return nil, fmt.Errorf("run whisper.cpp: %w", err)
 	}
 
 	contents, err := os.ReadFile(outputBase + ".json")

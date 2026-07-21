@@ -2,11 +2,70 @@ package recording
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestSQLiteMigratesLegacyFailedTranscriptionToExecutionCategory(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(dir, "jimpachi.db"))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TABLE recordings (id TEXT PRIMARY KEY, title TEXT NOT NULL, started_at_unix_ns INTEGER NOT NULL, duration_ns INTEGER NOT NULL, audio_path TEXT NOT NULL, pending_promotion INTEGER NOT NULL DEFAULT 0, interrupted INTEGER NOT NULL DEFAULT 0, transcription_status TEXT NOT NULL DEFAULT 'pending', transcription_error TEXT NOT NULL DEFAULT ''); INSERT INTO recordings (id, title, started_at_unix_ns, duration_ns, audio_path, transcription_status, transcription_error) VALUES ('recording-1', 'Instructions', 0, 0, 'missing.opus', 'failed', 'Transcription could not be completed.');`)
+	if err != nil {
+		t.Fatalf("create legacy database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	store, err := OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	detail, err := store.Recording(ctx, "recording-1")
+	if err != nil {
+		t.Fatalf("Recording() error = %v", err)
+	}
+	if detail.TranscriptionFailureCategory != ProcessingFailureExecution {
+		t.Errorf("legacy failure category = %q, want execution", detail.TranscriptionFailureCategory)
+	}
+}
+
+func TestSQLiteDoesNotSilentlyCancelAClaimedTranscription(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	path := filepath.Join(t.TempDir(), "recording.opus")
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create Recording audio: %v", err)
+	}
+	if err := store.Save(ctx, Recording{ID: "recording-1", Title: "Instructions", StartedAt: time.Now(), AudioPath: path}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.QueueTranscription(ctx, "recording-1"); err != nil {
+		t.Fatalf("QueueTranscription() error = %v", err)
+	}
+	if _, err := store.ClaimNextPendingTranscription(ctx); err != nil {
+		t.Fatalf("ClaimNextPendingTranscription() error = %v", err)
+	}
+	cancelled, err := store.CancelQueuedTranscription(ctx, "recording-1")
+	if err != nil {
+		t.Fatalf("CancelQueuedTranscription() error = %v", err)
+	}
+	if cancelled {
+		t.Error("CancelQueuedTranscription() cancelled an already claimed attempt")
+	}
+}
 
 func TestSQLitePersistsRecordingHistoryAcrossReopen(t *testing.T) {
 	ctx := context.Background()

@@ -78,6 +78,29 @@ func TestWorkflowAutomaticallyTranscribesCompletedRecording(t *testing.T) {
 	}
 }
 
+func TestWorkflowReturnsQueuedStatusAfterAutomaticRecordingStop(t *testing.T) {
+	ctx := context.Background()
+	transcriber := &blockingTranscriber{started: make(chan struct{})}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, t.TempDir(), fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatalf("StopRecording() error = %v", err)
+	}
+	if completed.TranscriptionStatus != recording.TranscriptionPending && completed.TranscriptionStatus != recording.TranscriptionRunning {
+		t.Errorf("StopRecording() status = %q, want queued or running", completed.TranscriptionStatus)
+	}
+}
+
 func TestWorkflowAllowsManualTranscriptionWhenAutomaticTranscriptionIsDisabled(t *testing.T) {
 	ctx := context.Background()
 	transcriber := &fakeTranscriber{segments: []transcription.Segment{{Start: time.Second, End: 2 * time.Second, Text: "Check the release."}}}
@@ -128,6 +151,37 @@ func TestWorkflowAllowsManualTranscriptionWhenAutomaticTranscriptionIsDisabled(t
 	}
 	if len(detail.Transcription) != 1 || detail.Transcription[0].Text != "Check the release." {
 		t.Errorf("manual Transcription = %#v, want saved segment", detail.Transcription)
+	}
+}
+
+func TestWorkflowDoesNotQueueCompletedRecordingWhenAutomaticTranscriptionIsDisabled(t *testing.T) {
+	ctx := context.Background()
+	transcriber := &blockingTranscriber{started: make(chan struct{})}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, t.TempDir(), fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SetAutomaticTranscription(ctx, false); err != nil {
+		t.Fatalf("SetAutomaticTranscription() error = %v", err)
+	}
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatalf("SelectAudioSource() error = %v", err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatalf("StartRecording() error = %v", err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatalf("StopRecording() error = %v", err)
+	}
+	if detail, err := workflow.Recording(ctx, completed.ID); err != nil || detail.TranscriptionStatus != recording.TranscriptionNotQueued {
+		t.Fatalf("completed Transcription = %#v, %v; want not queued", detail, err)
+	}
+	select {
+	case <-transcriber.started:
+		t.Fatal("disabled automatic Transcription started without a manual request")
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 
@@ -207,6 +261,230 @@ func TestWorkflowRecoversRunningTranscriptionAfterRestart(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
+}
+
+func TestWorkflowQueuesCompletedRecordingsSerially(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	first := saveCompletedRecording(t, dir, "first")
+	second := saveCompletedRecording(t, dir, "second")
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	for _, completed := range []recording.Recording{first, second} {
+		if err := store.QueueTranscription(ctx, completed.ID); err != nil {
+			t.Fatalf("QueueTranscription() error = %v", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	transcriber := &serialTranscriber{started: make(chan string, 2), release: make(chan struct{})}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, dir, fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+
+	if got := <-transcriber.started; got != first.AudioPath {
+		t.Fatalf("first queued audio = %q, want %q", got, first.AudioPath)
+	}
+	select {
+	case got := <-transcriber.started:
+		t.Fatalf("second queued audio started before first completed: %q", got)
+	default:
+	}
+	close(transcriber.release)
+	if got := <-transcriber.started; got != second.AudioPath {
+		t.Errorf("second queued audio = %q, want %q", got, second.AudioPath)
+	}
+}
+
+func TestWorkflowCancelsAndRetriesTranscriptionWithSafeFailureState(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	completed := saveCompletedRecording(t, dir, "recording-1")
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	if err := store.SaveSetting(ctx, "automatic_transcription", "false"); err != nil {
+		t.Fatalf("SaveSetting() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	transcriber := &retryingTranscriber{started: make(chan struct{}, 1)}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, dir, fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if _, err := workflow.RequestTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("RequestTranscription() error = %v", err)
+	}
+	<-transcriber.started
+	if err := workflow.CancelTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("CancelTranscription() error = %v", err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if detail.TranscriptionStatus == recording.TranscriptionCancelled {
+			if detail.TranscriptionFailureCategory != recording.ProcessingFailureCancelled || detail.TranscriptionError != "Transcription was cancelled." {
+				t.Errorf("cancelled Transcription = %q, %q", detail.TranscriptionFailureCategory, detail.TranscriptionError)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("Transcription status = %q, want cancelled", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if _, err := workflow.RequestTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("retry RequestTranscription() error = %v", err)
+	}
+	deadline = time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if detail.TranscriptionStatus == recording.TranscriptionSucceeded {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("retried Transcription status = %q, want succeeded", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestWorkflowCancellationCannotOverwriteSuccessfulTranscription(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	completed := saveCompletedRecording(t, dir, "recording-1")
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	if err := store.SaveSetting(ctx, "automatic_transcription", "false"); err != nil {
+		t.Fatalf("SaveSetting() error = %v", err)
+	}
+	if err := store.SaveTranscription(ctx, completed.ID, []recording.Segment{{Text: "Previous."}}); err != nil {
+		t.Fatalf("SaveTranscription() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	transcriber := &stubbornTranscriber{started: make(chan struct{}), release: make(chan struct{})}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, dir, fakeAudio{}, transcriber)
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if _, err := workflow.RequestTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("RequestTranscription() error = %v", err)
+	}
+	<-transcriber.started
+	if err := workflow.CancelTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("CancelTranscription() error = %v", err)
+	}
+	close(transcriber.release)
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if detail.TranscriptionStatus == recording.TranscriptionCancelled {
+			if len(detail.Transcription) != 1 || detail.Transcription[0].Text != "Previous." {
+				t.Errorf("cancelled Transcription = %#v, want preserved previous artifact", detail.Transcription)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("Transcription status = %q, want cancelled", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestWorkflowHidesTranscriberDiagnosticsBehindStableFailureOutcome(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	completed := saveCompletedRecording(t, dir, "recording-1")
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	if err := store.SaveSetting(ctx, "automatic_transcription", "false"); err != nil {
+		t.Fatalf("SaveSetting() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	workflow, err := OpenWithAudioAndTranscriber(ctx, dir, fakeAudio{}, &fakeTranscriber{err: errors.New("/private/recordings/recording-1.opus contains spoken instructions")})
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndTranscriber() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if _, err := workflow.RequestTranscription(ctx, completed.ID); err != nil {
+		t.Fatalf("RequestTranscription() error = %v", err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatalf("Recording() error = %v", err)
+		}
+		if detail.TranscriptionStatus == recording.TranscriptionFailed {
+			if detail.TranscriptionFailureCategory != recording.ProcessingFailureExecution {
+				t.Errorf("failure category = %q, want execution", detail.TranscriptionFailureCategory)
+			}
+			if detail.TranscriptionError != "Transcription could not be completed. Try again." || strings.Contains(detail.TranscriptionError, "private") {
+				t.Errorf("user-visible failure = %q, want safe detail", detail.TranscriptionError)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("Transcription status = %q, want failed", detail.TranscriptionStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func saveCompletedRecording(t *testing.T, dir, id string) recording.Recording {
+	t.Helper()
+	path := filepath.Join(dir, "recordings", id+".opus")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create recordings directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatalf("create Recording audio: %v", err)
+	}
+	store, err := recording.OpenSQLite(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	result := recording.Recording{ID: id, Title: id, StartedAt: time.Now(), AudioPath: path}
+	if err := store.Save(context.Background(), result); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	return result
 }
 
 func TestDataDirUsesXDGDataHome(t *testing.T) {
@@ -991,6 +1269,43 @@ func (f *fakeTranscriber) Transcribe(context.Context, string) ([]transcription.S
 type blockingTranscriber struct {
 	started chan struct{}
 	once    sync.Once
+}
+
+type serialTranscriber struct {
+	started chan string
+	release chan struct{}
+}
+
+func (f *serialTranscriber) Transcribe(_ context.Context, path string) ([]transcription.Segment, error) {
+	f.started <- path
+	<-f.release
+	return nil, nil
+}
+
+type retryingTranscriber struct {
+	started  chan struct{}
+	attempts int
+}
+
+type stubbornTranscriber struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *stubbornTranscriber) Transcribe(context.Context, string) ([]transcription.Segment, error) {
+	close(f.started)
+	<-f.release
+	return []transcription.Segment{{Text: "Cancelled replacement."}}, nil
+}
+
+func (f *retryingTranscriber) Transcribe(ctx context.Context, _ string) ([]transcription.Segment, error) {
+	f.attempts++
+	if f.attempts == 1 {
+		close(f.started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []transcription.Segment{{Text: "Retried."}}, nil
 }
 
 func (f *blockingTranscriber) Transcribe(ctx context.Context, _ string) ([]transcription.Segment, error) {

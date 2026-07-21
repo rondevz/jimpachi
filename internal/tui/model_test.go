@@ -98,6 +98,51 @@ func TestModelShowsFailedTranscriptionAndStopsPolling(t *testing.T) {
 	_ = updated
 }
 
+func TestModelShowsQueuedProcessingAndOffersCancellation(t *testing.T) {
+	pending := recording.Recording{ID: "recording-1", Title: "Instructions", TranscriptionStatus: recording.TranscriptionPending}
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{pending}}))
+	if view := model.View(); !strings.Contains(view, "Post-processing: queued") {
+		t.Errorf("View() = %q, want queued post-processing status", view)
+	}
+	model.detail = &pending
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if command == nil {
+		t.Fatal("cancellation key did not issue a workflow command")
+	}
+	_ = updated
+	if _, ok := command().(transcriptionCancelled); !ok {
+		t.Fatalf("cancellation command message = %T, want transcriptionCancelled", command())
+	}
+}
+
+func TestModelUpdatesHistoryStatusAfterManualRequestAndCancellation(t *testing.T) {
+	queued := recording.Recording{ID: "recording-1", Title: "Instructions", TranscriptionStatus: recording.TranscriptionPending}
+	workflow := fakeHistory{recordings: []recording.Recording{{ID: queued.ID, Title: queued.Title, TranscriptionStatus: recording.TranscriptionNotQueued}}, requested: &queued}
+	model := load(t, New(context.Background(), workflow))
+	model.detail = &recording.Recording{ID: queued.ID, TranscriptionStatus: recording.TranscriptionNotQueued}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	updated, _ = updated.Update(command())
+	model = updated.(Model)
+	if model.recordings[0].TranscriptionStatus != recording.TranscriptionPending {
+		t.Errorf("history status after request = %q, want pending", model.recordings[0].TranscriptionStatus)
+	}
+	updated, _ = model.Update(transcriptionCancelled{id: queued.ID, recording: recording.Recording{ID: queued.ID, TranscriptionStatus: recording.TranscriptionCancelled}})
+	model = updated.(Model)
+	if model.recordings[0].TranscriptionStatus != recording.TranscriptionCancelled {
+		t.Errorf("history status after cancellation = %q, want cancelled", model.recordings[0].TranscriptionStatus)
+	}
+}
+
+func TestModelUsesQueuedStatusReturnedAfterAutomaticStopInHistory(t *testing.T) {
+	completed := recording.Recording{ID: "recording-1", Title: "Instructions", TranscriptionStatus: recording.TranscriptionPending}
+	model := Model{workflow: fakeHistory{}, stopPending: true, recordingOp: 1}
+	updated, _ := model.Update(recordingStopped{recording: completed, operation: 1})
+	model = updated.(Model)
+	if len(model.recordings) != 1 || model.recordings[0].TranscriptionStatus != recording.TranscriptionPending {
+		t.Errorf("history after automatic stop = %#v, want queued Recording", model.recordings)
+	}
+}
+
 func TestModelShowsMissingAudioCondition(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: "Moved", AudioMissing: true}}}))
 	if !strings.Contains(model.View(), "Audio file is missing.") {
@@ -604,6 +649,7 @@ type fakeHistory struct {
 	limitWrites  *[]time.Duration
 	limitErr     error
 	requested    *recording.Recording
+	cancelled    *string
 }
 
 func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return f.startup, nil }
@@ -663,6 +709,13 @@ func (f fakeHistory) RequestTranscription(_ context.Context, id string) (recordi
 		return *f.requested, nil
 	}
 	return f.Recording(context.Background(), id)
+}
+
+func (f fakeHistory) CancelTranscription(_ context.Context, id string) error {
+	if f.cancelled != nil {
+		*f.cancelled = id
+	}
+	return nil
 }
 
 func sameDurations(got, want []time.Duration) bool {
@@ -730,3 +783,5 @@ func (f blockingHistory) Recording(context.Context, string) (recording.Recording
 func (f blockingHistory) RequestTranscription(context.Context, string) (recording.Recording, error) {
 	return recording.Recording{}, nil
 }
+
+func (f blockingHistory) CancelTranscription(context.Context, string) error { return nil }

@@ -35,9 +35,11 @@ type Workflow struct {
 	workerCancel             context.CancelFunc
 	workerWake               chan struct{}
 	workerWG                 sync.WaitGroup
-	pendingTranscription     *recording.Recording
 	runningCancel            context.CancelFunc
 	runningDone              chan struct{}
+	runningID                string
+	runningAttempt           uint64
+	runningCancelledByUser   bool
 	processingPaused         bool
 }
 
@@ -135,17 +137,7 @@ func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcribe
 		_ = workflow.Close()
 		return nil, err
 	} else if enabled {
-		pending, err := workflow.nextPendingTranscription(ctx)
-		if err != nil {
-			_ = workflow.Close()
-			return nil, err
-		}
-		if pending != nil {
-			if err := workflow.enqueueTranscription(ctx, *pending); err != nil {
-				_ = workflow.Close()
-				return nil, err
-			}
-		}
+		workflow.wakeTranscriptionWorker()
 	}
 	return workflow, nil
 }
@@ -453,17 +445,22 @@ func (w *Workflow) StopRecording(ctx context.Context) (recording.Recording, erro
 	if err := w.history.Save(ctx, active.recording); err != nil {
 		return recording.Recording{}, fmt.Errorf("complete Recording promotion: %w", err)
 	}
+	completed := active.recording
 	w.recordingMu.Lock()
 	w.activeRecording = nil
-	if active.limitReached {
-		w.captureCompleted = &active.recording
-	}
 	w.recordingMu.Unlock()
-	completed := active.recording
 	w.resumeTranscription()
 	if enabled, err := w.AutomaticTranscription(ctx); err == nil && enabled {
 		_ = w.enqueueTranscription(ctx, completed)
 	}
+	if persisted, err := w.Recording(ctx, completed.ID); err == nil {
+		completed = persisted
+	}
+	w.recordingMu.Lock()
+	if active.limitReached {
+		w.captureCompleted = &completed
+	}
+	w.recordingMu.Unlock()
 	return completed, nil
 }
 
@@ -480,6 +477,9 @@ func (w *Workflow) AutomaticTranscription(ctx context.Context) (bool, error) {
 func (w *Workflow) SetAutomaticTranscription(ctx context.Context, enabled bool) error {
 	if err := w.history.SaveSetting(ctx, "automatic_transcription", strconv.FormatBool(enabled)); err != nil {
 		return fmt.Errorf("save automatic Transcription setting: %w", err)
+	}
+	if enabled {
+		w.wakeTranscriptionWorker()
 	}
 	return nil
 }
@@ -499,6 +499,55 @@ func (w *Workflow) RequestTranscription(ctx context.Context, id string) (recordi
 	return w.Recording(ctx, id)
 }
 
+// CancelTranscription stops or removes a queued Transcription without affecting its Recording.
+func (w *Workflow) CancelTranscription(ctx context.Context, id string) error {
+	detail, err := w.history.Recording(ctx, id)
+	if err != nil {
+		return fmt.Errorf("load Recording to cancel Transcription: %w", err)
+	}
+	switch detail.TranscriptionStatus {
+	case recording.TranscriptionPending:
+		cancelled, err := w.history.CancelQueuedTranscription(ctx, id)
+		if err != nil {
+			return fmt.Errorf("cancel pending Transcription: %w", err)
+		}
+		if cancelled {
+			return nil
+		}
+		// A worker may claim the queue entry between the initial read and this
+		// conditional update. Re-read before reporting success to the user.
+		detail, err = w.history.Recording(ctx, id)
+		if err != nil {
+			return fmt.Errorf("reload Transcription after queue cancellation: %w", err)
+		}
+		if detail.TranscriptionStatus != recording.TranscriptionRunning {
+			return fmt.Errorf("cancel Transcription: work changed before cancellation (currently %s)", detail.TranscriptionStatus)
+		}
+		return w.cancelRunningTranscription(ctx, detail)
+	case recording.TranscriptionRunning:
+		return w.cancelRunningTranscription(ctx, detail)
+	default:
+		return fmt.Errorf("cancel Transcription: no queued Transcription for Recording %q", id)
+	}
+}
+
+func (w *Workflow) cancelRunningTranscription(ctx context.Context, detail recording.Recording) error {
+	cancelled, err := w.history.TransitionTranscriptionAttempt(ctx, detail.ID, detail.TranscriptionAttempt, recording.TranscriptionCancelled, recording.ProcessingFailureCancelled, "Transcription was cancelled.")
+	if err != nil {
+		return fmt.Errorf("cancel running Transcription: %w", err)
+	}
+	if !cancelled {
+		return fmt.Errorf("cancel Transcription: work changed before cancellation")
+	}
+	w.processingMu.Lock()
+	if w.runningID == detail.ID && w.runningAttempt == detail.TranscriptionAttempt && w.runningCancel != nil {
+		w.runningCancelledByUser = true
+		w.runningCancel()
+	}
+	w.processingMu.Unlock()
+	return nil
+}
+
 // Recording returns a detail view including its full timestamped Transcription.
 func (w *Workflow) Recording(ctx context.Context, id string) (recording.Recording, error) {
 	detail, err := w.history.Recording(ctx, id)
@@ -509,45 +558,29 @@ func (w *Workflow) Recording(ctx context.Context, id string) (recording.Recordin
 }
 
 func (w *Workflow) enqueueTranscription(ctx context.Context, completed recording.Recording) error {
-	if err := w.history.SaveTranscriptionStatus(ctx, completed.ID, recording.TranscriptionPending, ""); err != nil {
+	if completed.TranscriptionStatus == recording.TranscriptionRunning || completed.TranscriptionStatus == recording.TranscriptionPending {
+		if completed.TranscriptionStatus == recording.TranscriptionPending {
+			w.wakeTranscriptionWorker()
+		}
+		return nil
+	}
+	if err := w.history.QueueTranscription(ctx, completed.ID); err != nil {
 		return fmt.Errorf("queue Transcription for Recording %q: %w", completed.ID, err)
 	}
-	w.processingMu.Lock()
-	w.pendingTranscription = &completed
-	if w.runningCancel != nil {
-		w.runningCancel()
-	}
-	w.processingMu.Unlock()
 	w.wakeTranscriptionWorker()
 	return nil
 }
 
-func (w *Workflow) nextPendingTranscription(ctx context.Context) (*recording.Recording, error) {
-	history, err := w.history.History(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("load pending Transcriptions: %w", err)
-	}
-	for _, completed := range history {
-		if completed.TranscriptionStatus == recording.TranscriptionPending && !completed.PendingPromotion && !completed.Interrupted && !completed.AudioMissing {
-			return &completed, nil
-		}
-	}
-	return nil, nil
-}
-
-func (w *Workflow) transcribe(ctx context.Context, completed recording.Recording) error {
+func (w *Workflow) transcribe(ctx context.Context, completed recording.Recording) ([]recording.Segment, error) {
 	segments, err := w.transcriber.Transcribe(ctx, completed.AudioPath)
 	if err != nil {
-		return fmt.Errorf("transcribe Recording %q: %w", completed.ID, err)
+		return nil, fmt.Errorf("transcribe Recording %q: %w", completed.ID, err)
 	}
 	persisted := make([]recording.Segment, len(segments))
 	for index, segment := range segments {
 		persisted[index] = recording.Segment{Start: segment.Start, End: segment.End, Text: segment.Text}
 	}
-	if err := w.history.SaveTranscription(ctx, completed.ID, persisted); err != nil {
-		return fmt.Errorf("save Transcription for Recording %q: %w", completed.ID, err)
-	}
-	return nil
+	return persisted, nil
 }
 
 func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
@@ -563,37 +596,69 @@ func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
 				return
 			}
 			w.processingMu.Lock()
-			if w.pendingTranscription == nil || w.processingPaused {
-				w.processingMu.Unlock()
+			paused := w.processingPaused
+			w.processingMu.Unlock()
+			if paused {
 				break
 			}
-			completed := *w.pendingTranscription
-			w.pendingTranscription = nil
+			completed, err := w.history.ClaimNextPendingTranscription(ctx)
+			if err != nil {
+				// Persistence failures cannot safely be shown as a Recording failure here;
+				// leave durable work pending for the next explicit wake or restart.
+				break
+			}
+			if completed == nil {
+				break
+			}
+			if _, err := os.Stat(completed.AudioPath); err != nil {
+				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionFailed, recording.ProcessingFailureExecution, "Recording audio is unavailable. Restore the audio file and try again.")
+				continue
+			}
+			claimed, err := w.history.Recording(ctx, completed.ID)
+			if err != nil || claimed.TranscriptionStatus != recording.TranscriptionRunning {
+				continue
+			}
+			w.processingMu.Lock()
+			if w.processingPaused {
+				w.processingMu.Unlock()
+				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionPending, "", "")
+				break
+			}
 			runCtx, cancel := context.WithCancel(ctx)
 			done := make(chan struct{})
-			w.runningCancel, w.runningDone = cancel, done
+			w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = cancel, done, completed.ID, completed.TranscriptionAttempt, false
 			w.processingMu.Unlock()
 
-			_ = w.history.SaveTranscriptionStatus(runCtx, completed.ID, recording.TranscriptionRunning, "")
-			err := w.transcribe(runCtx, completed)
-			if runCtx.Err() != nil {
-				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionPending, "")
-			} else if err != nil {
-				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionFailed, "Transcription could not be completed. Check the local whisper.cpp setup and try again.")
+			segments, runErr := w.transcribe(runCtx, *completed)
+			w.processingMu.Lock()
+			cancelledByUser := w.runningCancelledByUser
+			w.processingMu.Unlock()
+			if runCtx.Err() != nil && cancelledByUser {
+				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionCancelled, recording.ProcessingFailureCancelled, "Transcription was cancelled.")
+			} else if runCtx.Err() != nil {
+				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionPending, "", "")
+			} else if runErr != nil {
+				category, detail := transcriptionFailure(runErr)
+				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionFailed, category, detail)
 			} else {
-				_ = w.history.SaveTranscriptionStatus(context.Background(), completed.ID, recording.TranscriptionSucceeded, "")
+				_, _ = w.history.CompleteTranscriptionAttempt(runCtx, completed.ID, completed.TranscriptionAttempt, segments)
 			}
 			cancel()
 			w.processingMu.Lock()
-			w.runningCancel, w.runningDone = nil, nil
+			w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = nil, nil, "", 0, false
 			close(done)
-			hasPending := w.pendingTranscription != nil
 			w.processingMu.Unlock()
-			if !hasPending {
-				break
-			}
 		}
 	}
+}
+
+func transcriptionFailure(err error) (recording.ProcessingFailureCategory, string) {
+	// External tool errors may include audio paths or spoken text. Only stable,
+	// user-safe outcomes cross this boundary; no raw diagnostic is persisted or logged.
+	if strings.Contains(err.Error(), "not configured") || strings.Contains(err.Error(), "configuration") {
+		return recording.ProcessingFailureConfiguration, "Local transcription is not configured. Check the whisper.cpp executable and model paths."
+	}
+	return recording.ProcessingFailureExecution, "Transcription could not be completed. Try again."
 }
 
 func (w *Workflow) wakeTranscriptionWorker() {

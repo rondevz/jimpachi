@@ -34,6 +34,8 @@ Jimpachi lists system-output monitor sources, rather than microphone inputs. Use
 
 Jimpachi runs configured `whisper.cpp` locally with language auto-detection and three CPU threads by default. It saves each timestamped segment in SQLite and displays the full document in Recording detail. Automatic transcription is enabled by default; press `p` to disable or re-enable it. Press `t` in a Recording detail view to request transcription manually.
 
+Post-processing is serial and its queued, active, failed, or cancelled state is visible in Recording history and detail. Recording has priority: starting a new capture pauses queued work and cancels the active attempt so it can resume afterward. Press `c` in a queued or active Recording detail view to cancel it; press `t` to retry a failed or cancelled attempt. Failures show a stable, user-safe category and guidance while preserving the Recording and any previous Transcription.
+
 Configure the executable and model paths in `~/.config/jimpachi/config.toml`, or under `$XDG_CONFIG_HOME/jimpachi/config.toml` when `XDG_CONFIG_HOME` is set:
 
 ```toml
