@@ -34,6 +34,8 @@ type Workflow interface {
 	RequestSummary(context.Context, string) (recording.Recording, error)
 	CancelTranscription(context.Context, string) error
 	CancelSummary(context.Context, string) error
+	OpenRecordingAudio(context.Context, string) error
+	DeleteRecording(context.Context, string) error
 	Settings(context.Context) (app.Settings, error)
 	SaveSettings(context.Context, app.Settings) error
 }
@@ -81,6 +83,7 @@ type Model struct {
 	settingsEditing string
 	settingsInput   string
 	settingsSaving  bool
+	confirmDeletion bool
 }
 
 // New creates a terminal model backed by Recording history.
@@ -324,6 +327,25 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.persistedLimit = message.settings.RecordingLimit
 		m.automatic = message.settings.AutomaticTranscription
 		return m, nil
+	case recordingDeleted:
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.confirmDeletion = false
+		m.detail = nil
+		for index := range m.recordings {
+			if m.recordings[index].ID == message.id {
+				m.recordings = append(m.recordings[:index], m.recordings[index+1:]...)
+				break
+			}
+		}
+		return m, nil
+	case recordingAudioOpened:
+		if message.err != nil {
+			m.err = message.err
+		}
+		return m, nil
 	case recordingTick:
 		state := m.workflow.CaptureState()
 		if state.Completed != nil {
@@ -393,6 +415,17 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				if len(key) == 1 {
 					m.title += key
 				}
+			}
+			return m, nil
+		}
+		if m.confirmDeletion {
+			switch key {
+			case "y":
+				if m.detail != nil {
+					return m, m.deleteRecording(m.detail.ID)
+				}
+			case "n", "esc":
+				m.confirmDeletion = false
 			}
 			return m, nil
 		}
@@ -487,6 +520,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if m.detail != nil {
 				m.editingTitle = true
 				m.title = m.detail.Title
+			}
+		case "o":
+			if m.detail != nil {
+				return m, m.openRecordingAudio(m.detail.ID)
+			}
+		case "d":
+			if m.detail != nil {
+				m.confirmDeletion = true
 			}
 		case "t":
 			if m.detail != nil && !m.transcribing {
@@ -647,6 +688,10 @@ func (m Model) View() string {
 			if m.detail.Interrupted {
 				view.WriteString("Interrupted capture recovered after restart.\n")
 			}
+			if m.confirmDeletion {
+				view.WriteString("\nDelete this Recording and all local artifacts? Press y to confirm or n to cancel.\n")
+				return view.String()
+			}
 			view.WriteString("\nTranscription\n\n")
 			switch m.detail.TranscriptionStatus {
 			case recording.TranscriptionPending:
@@ -693,17 +738,17 @@ func (m Model) View() string {
 				view.WriteString("No Summary yet.\n")
 			}
 			if m.detail.TranscriptionStatus == recording.TranscriptionFailed || m.detail.TranscriptionStatus == recording.TranscriptionCancelled {
-				view.WriteString("\nPress t to retry transcription; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress t to retry transcription; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			} else if m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning {
-				view.WriteString("\nPress c to cancel; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress c to cancel; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) {
-				view.WriteString("\nPress c to cancel Summary; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress c to cancel Summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionFailed || m.detail.SummaryStatus == recording.TranscriptionCancelled) {
-				view.WriteString("\nPress m to retry Summary; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress m to retry Summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded {
-				view.WriteString("\nPress t to transcribe; m to generate summary; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress t to transcribe; m to generate summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			} else {
-				view.WriteString("\nPress t to transcribe; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress t to transcribe; o to open audio; d to delete; e to edit title; esc returns to history.\n")
 			}
 		}
 		return view.String()
@@ -863,6 +908,11 @@ type settingsSaved struct {
 	settings app.Settings
 	err      error
 }
+type recordingDeleted struct {
+	id  string
+	err error
+}
+type recordingAudioOpened struct{ err error }
 
 func (m Model) activityCommand() tea.Cmd {
 	if len(m.sources) == 0 {
@@ -998,6 +1048,14 @@ func (m Model) saveSettings(settings app.Settings) tea.Cmd {
 	return func() tea.Msg {
 		return settingsSaved{settings: settings, err: m.workflow.SaveSettings(m.ctx, settings)}
 	}
+}
+
+func (m Model) openRecordingAudio(id string) tea.Cmd {
+	return func() tea.Msg { return recordingAudioOpened{err: m.workflow.OpenRecordingAudio(m.ctx, id)} }
+}
+
+func (m Model) deleteRecording(id string) tea.Cmd {
+	return func() tea.Msg { return recordingDeleted{id: id, err: m.workflow.DeleteRecording(m.ctx, id)} }
 }
 
 func (m *Model) startSettingsEdit(field string) {

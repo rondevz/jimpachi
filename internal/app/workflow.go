@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ type Workflow struct {
 	transcriber Transcriber
 	summarizer  Summarizer
 	scheduler   Scheduler
+	opener      Opener
 
 	audioSourceMu            sync.Mutex
 	latestAudioSourceVersion uint64
@@ -54,6 +56,20 @@ type Transcriber interface {
 // Summarizer is the external local text-summary boundary used by Workflow.
 type Summarizer interface {
 	Summarize(context.Context, string) (summary.Summary, error)
+}
+
+// Opener reveals a local Recording audio file with the desktop's configured application.
+type Opener interface {
+	Open(context.Context, string) error
+}
+
+type desktopOpener struct{}
+
+func (desktopOpener) Open(ctx context.Context, path string) error {
+	if err := exec.CommandContext(ctx, "xdg-open", path).Run(); err != nil {
+		return fmt.Errorf("open Recording audio: %w", err)
+	}
+	return nil
 }
 
 type activeRecording struct {
@@ -143,7 +159,7 @@ func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcribe
 		return nil, fmt.Errorf("recover interrupted Recordings: %w", err)
 	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, summarizer: summarizer, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
+	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, summarizer: summarizer, scheduler: scheduler, opener: desktopOpener{}, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
 	workflow.workerWG.Add(1)
 	go workflow.runTranscriptionWorker(workerCtx)
 	if err := history.ResetRunningTranscriptions(ctx); err != nil {
@@ -1026,6 +1042,74 @@ func (w *Workflow) RenameRecording(ctx context.Context, id, title string) error 
 		return fmt.Errorf("rename Recording: %w", err)
 	}
 	return nil
+}
+
+// OpenRecordingAudio reveals a completed Recording's local audio with the desktop application.
+func (w *Workflow) OpenRecordingAudio(ctx context.Context, id string) error {
+	detail, err := w.Recording(ctx, id)
+	if err != nil {
+		return fmt.Errorf("open Recording audio: %w", err)
+	}
+	if _, err := os.Stat(detail.AudioPath); err != nil {
+		return fmt.Errorf("open Recording audio: audio is unavailable")
+	}
+	if err := w.opener.Open(ctx, detail.AudioPath); err != nil {
+		return fmt.Errorf("open Recording audio: %w", err)
+	}
+	return nil
+}
+
+// DeleteRecording intentionally removes a Recording and all of its local artifacts.
+func (w *Workflow) DeleteRecording(ctx context.Context, id string) error {
+	w.recordingMu.Lock()
+	active := w.activeRecording != nil && w.activeRecording.recording.ID == id
+	w.recordingMu.Unlock()
+	if active {
+		return fmt.Errorf("delete Recording: stop capture before deleting it")
+	}
+	detail, err := w.Recording(ctx, id)
+	if err != nil {
+		return fmt.Errorf("delete Recording: %w", err)
+	}
+	if detail.TranscriptionStatus == recording.TranscriptionPending || detail.TranscriptionStatus == recording.TranscriptionRunning {
+		if err := w.CancelTranscription(ctx, id); err != nil {
+			return fmt.Errorf("delete Recording: cancel Transcription: %w", err)
+		}
+	}
+	if detail.SummaryStatus == recording.TranscriptionPending || detail.SummaryStatus == recording.TranscriptionRunning {
+		if err := w.CancelSummary(ctx, id); err != nil {
+			return fmt.Errorf("delete Recording: cancel Summary: %w", err)
+		}
+	}
+	w.awaitRecordingProcessing(id)
+	staged := detail.AudioPath + ".deleting"
+	if err := os.Rename(detail.AudioPath, staged); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stage Recording audio for deletion: %w", err)
+	}
+	partial := strings.TrimSuffix(detail.AudioPath, ".opus") + ".partial.opus"
+	if err := w.history.Delete(ctx, id); err != nil {
+		if restoreErr := os.Rename(staged, detail.AudioPath); restoreErr != nil && !os.IsNotExist(restoreErr) {
+			return fmt.Errorf("delete Recording metadata: %w; restore staged audio: %v", err, restoreErr)
+		}
+		return fmt.Errorf("delete Recording metadata: %w", err)
+	}
+	if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove staged Recording audio: %w", err)
+	}
+	if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete staged Recording audio: %w", err)
+	}
+	return nil
+}
+
+func (w *Workflow) awaitRecordingProcessing(id string) {
+	w.processingMu.Lock()
+	done := w.runningDone
+	running := w.runningID == id
+	w.processingMu.Unlock()
+	if running && done != nil {
+		<-done
+	}
 }
 
 // Close releases the workflow's local resources.

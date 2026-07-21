@@ -102,6 +102,34 @@ func TestWorkflowReportsStaleLocalProcessingPathsInSettings(t *testing.T) {
 	}
 }
 
+func TestWorkflowOpensAndDeletesRecordingArtifacts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	completed := saveCompletedRecording(t, dir, "recording-1")
+	workflow, err := OpenWithAudioAndProcessors(ctx, dir, fakeAudio{}, &fakeTranscriber{}, &fakeSummarizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	opener := &fakeOpener{}
+	workflow.opener = opener
+	if err := workflow.OpenRecordingAudio(ctx, completed.ID); err != nil {
+		t.Fatalf("OpenRecordingAudio() error = %v", err)
+	}
+	if opener.path != completed.AudioPath {
+		t.Errorf("opened path = %q, want %q", opener.path, completed.AudioPath)
+	}
+	if err := workflow.DeleteRecording(ctx, completed.ID); err != nil {
+		t.Fatalf("DeleteRecording() error = %v", err)
+	}
+	if _, err := os.Stat(completed.AudioPath); !os.IsNotExist(err) {
+		t.Errorf("audio after DeleteRecording = %v, want removed", err)
+	}
+	if _, err := workflow.Recording(ctx, completed.ID); err == nil {
+		t.Error("Recording() after DeleteRecording error = nil, want removed metadata")
+	}
+}
+
 func TestWorkflowAutomaticallyTranscribesCompletedRecording(t *testing.T) {
 	ctx := context.Background()
 	transcriber := &fakeTranscriber{segments: []transcription.Segment{{Start: 0, End: 2 * time.Second, Text: "Deploy after lunch."}}}
@@ -1410,6 +1438,13 @@ type fakeAudio struct {
 	playableErr error
 	startErr    error
 	onStart     func(string)
+}
+
+type fakeOpener struct{ path string }
+
+func (f *fakeOpener) Open(_ context.Context, path string) error {
+	f.path = path
+	return nil
 }
 
 type fakeTranscriber struct {

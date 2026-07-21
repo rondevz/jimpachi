@@ -56,6 +56,27 @@ func TestModelShowsSettingsValidationFeedback(t *testing.T) {
 	}
 }
 
+func TestModelRequiresConfirmationBeforeDeletingRecording(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", Title: "Instructions"}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if command != nil {
+		t.Fatal("delete request did not require confirmation")
+	}
+	model = updated.(Model)
+	if !strings.Contains(model.View(), "Press y to confirm") {
+		t.Errorf("View() = %q, want deletion confirmation", model.View())
+	}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if command == nil {
+		t.Fatal("confirmed deletion did not call workflow")
+	}
+	if _, ok := command().(recordingDeleted); !ok {
+		t.Fatalf("deletion message = %T", command())
+	}
+	_ = updated
+}
+
 func TestModelShowsRecordingHistory(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{
 		ID:        "recording-1",
@@ -797,6 +818,10 @@ func (f fakeHistory) CancelTranscription(_ context.Context, id string) error {
 
 func (f fakeHistory) CancelSummary(context.Context, string) error { return nil }
 
+func (f fakeHistory) OpenRecordingAudio(context.Context, string) error { return nil }
+
+func (f fakeHistory) DeleteRecording(context.Context, string) error { return nil }
+
 func (f fakeHistory) Settings(context.Context) (app.Settings, error) { return f.settings, nil }
 
 func (f fakeHistory) SaveSettings(_ context.Context, settings app.Settings) error {
@@ -879,6 +904,10 @@ func (f blockingHistory) RequestSummary(context.Context, string) (recording.Reco
 func (f blockingHistory) CancelTranscription(context.Context, string) error { return nil }
 
 func (f blockingHistory) CancelSummary(context.Context, string) error { return nil }
+
+func (f blockingHistory) OpenRecordingAudio(context.Context, string) error { return nil }
+
+func (f blockingHistory) DeleteRecording(context.Context, string) error { return nil }
 
 func (f blockingHistory) Settings(context.Context) (app.Settings, error) { return app.Settings{}, nil }
 
