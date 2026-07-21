@@ -814,6 +814,25 @@ func TestWorkflowSelectsAndRestoresAudioSource(t *testing.T) {
 	}
 }
 
+func TestWorkflowDoesNotRestoreUnavailableNonExplicitAudioSource(t *testing.T) {
+	ctx := context.Background()
+	workflow, err := OpenWithAudio(ctx, t.TempDir(), fakeAudio{err: os.ErrNotExist})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "alsa_output.stale", Name: "Stale output"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	state, err := workflow.AudioSources(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Selected.ID != "" || len(state.Sources) != 0 {
+		t.Errorf("AudioSources() = %#v, want no stale selectable source", state)
+	}
+}
+
 func TestWorkflowPersistsLatestAudioSourceWhenEarlierSaveCompletesLast(t *testing.T) {
 	ctx := context.Background()
 	first := audio.Source{ID: "first.monitor", Name: "First"}

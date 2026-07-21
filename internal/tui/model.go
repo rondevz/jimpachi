@@ -779,7 +779,7 @@ func (m Model) View() string {
 	view.WriteString("Recording history\n\n")
 
 	if m.err != nil {
-		fmt.Fprintf(&view, "Unable to load Recording history: %v\n", m.err)
+		fmt.Fprintf(&view, "Jimpachi error: %v\n", m.err)
 		return view.String()
 	}
 	if len(m.recordings) == 0 {

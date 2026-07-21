@@ -354,8 +354,21 @@ func (w *Workflow) AudioSources(ctx context.Context) (AudioState, error) {
 				break
 			}
 		}
-		if !found {
+		if found {
+			return state, nil
+		}
+		if state.Selected.Explicit {
 			state.Sources = append([]audio.Source{state.Selected}, state.Sources...)
+			return state, nil
+		}
+		if discoveryErr == nil {
+			state.Sources = append([]audio.Source{state.Selected}, state.Sources...)
+			return state, nil
+		}
+		if len(state.Sources) > 0 {
+			state.Selected = state.Sources[0]
+		} else {
+			state.Selected = audio.Source{}
 		}
 		return state, nil
 	}
