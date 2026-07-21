@@ -13,6 +13,7 @@ import (
 
 	"jimpachi/internal/audio"
 	"jimpachi/internal/recording"
+	"jimpachi/internal/summary"
 	"jimpachi/internal/transcription"
 )
 
@@ -21,6 +22,7 @@ type Workflow struct {
 	history     *recording.SQLite
 	audio       audio.Adapter
 	transcriber Transcriber
+	summarizer  Summarizer
 	scheduler   Scheduler
 
 	audioSourceMu            sync.Mutex
@@ -46,6 +48,11 @@ type Workflow struct {
 // Transcriber is the external local speech-to-text boundary used by Workflow.
 type Transcriber interface {
 	Transcribe(context.Context, string) ([]transcription.Segment, error)
+}
+
+// Summarizer is the external local text-summary boundary used by Workflow.
+type Summarizer interface {
+	Summarize(context.Context, string) (summary.Summary, error)
 }
 
 type activeRecording struct {
@@ -102,20 +109,29 @@ func OpenWithAudio(ctx context.Context, dataDir string, adapter audio.Adapter) (
 	if err != nil {
 		return nil, err
 	}
-	return OpenWithAudioAndTranscriber(ctx, dataDir, adapter, whisper)
+	ollama, err := summary.LoadConfiguredOllama()
+	if err != nil {
+		return nil, err
+	}
+	return OpenWithAudioAndProcessors(ctx, dataDir, adapter, whisper, ollama)
 }
 
 // OpenWithAudioAndTranscriber creates a workflow with replaceable local transcription.
 func OpenWithAudioAndTranscriber(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber) (*Workflow, error) {
-	return open(ctx, dataDir, adapter, transcriber, realScheduler{})
+	return OpenWithAudioAndProcessors(ctx, dataDir, adapter, transcriber, summary.Ollama{})
+}
+
+// OpenWithAudioAndProcessors creates a workflow with replaceable local processing adapters.
+func OpenWithAudioAndProcessors(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber, summarizer Summarizer) (*Workflow, error) {
+	return open(ctx, dataDir, adapter, transcriber, summarizer, realScheduler{})
 }
 
 // OpenWithAudioAndScheduler creates a workflow with a controllable time seam.
 func OpenWithAudioAndScheduler(ctx context.Context, dataDir string, adapter audio.Adapter, scheduler Scheduler) (*Workflow, error) {
-	return open(ctx, dataDir, adapter, transcription.Whisper{}, scheduler)
+	return open(ctx, dataDir, adapter, transcription.Whisper{}, summary.Ollama{}, scheduler)
 }
 
-func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber, scheduler Scheduler) (*Workflow, error) {
+func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcriber Transcriber, summarizer Summarizer, scheduler Scheduler) (*Workflow, error) {
 	history, err := recording.OpenSQLite(ctx, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open application workflow: %w", err)
@@ -126,12 +142,16 @@ func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcribe
 		return nil, fmt.Errorf("recover interrupted Recordings: %w", err)
 	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
+	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, summarizer: summarizer, scheduler: scheduler, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
 	workflow.workerWG.Add(1)
 	go workflow.runTranscriptionWorker(workerCtx)
 	if err := history.ResetRunningTranscriptions(ctx); err != nil {
 		_ = workflow.Close()
 		return nil, fmt.Errorf("recover running Transcriptions: %w", err)
+	}
+	if err := history.ResetRunningSummaries(ctx); err != nil {
+		_ = workflow.Close()
+		return nil, fmt.Errorf("recover running Summaries: %w", err)
 	}
 	if enabled, err := workflow.AutomaticTranscription(ctx); err != nil {
 		_ = workflow.Close()
@@ -499,6 +519,22 @@ func (w *Workflow) RequestTranscription(ctx context.Context, id string) (recordi
 	return w.Recording(ctx, id)
 }
 
+// RequestSummary manually queues a Summary for a successfully transcribed Recording.
+func (w *Workflow) RequestSummary(ctx context.Context, id string) (recording.Recording, error) {
+	detail, err := w.history.Recording(ctx, id)
+	if err != nil {
+		return recording.Recording{}, fmt.Errorf("load Recording for Summary: %w", err)
+	}
+	if detail.TranscriptionStatus != recording.TranscriptionSucceeded {
+		return recording.Recording{}, fmt.Errorf("request Summary: Transcription is not available")
+	}
+	if err := w.history.QueueSummary(ctx, id); err != nil {
+		return recording.Recording{}, fmt.Errorf("queue Summary: %w", err)
+	}
+	w.wakeTranscriptionWorker()
+	return w.Recording(ctx, id)
+}
+
 // CancelTranscription stops or removes a queued Transcription without affecting its Recording.
 func (w *Workflow) CancelTranscription(ctx context.Context, id string) error {
 	detail, err := w.history.Recording(ctx, id)
@@ -528,6 +564,49 @@ func (w *Workflow) CancelTranscription(ctx context.Context, id string) error {
 		return w.cancelRunningTranscription(ctx, detail)
 	default:
 		return fmt.Errorf("cancel Transcription: no queued Transcription for Recording %q", id)
+	}
+}
+
+// CancelSummary stops or removes a queued Summary without affecting its Recording or Transcription.
+func (w *Workflow) CancelSummary(ctx context.Context, id string) error {
+	detail, err := w.history.Recording(ctx, id)
+	if err != nil {
+		return fmt.Errorf("load Recording to cancel Summary: %w", err)
+	}
+	switch detail.SummaryStatus {
+	case recording.TranscriptionPending:
+		cancelled, err := w.history.CancelQueuedSummary(ctx, id)
+		if err != nil {
+			return fmt.Errorf("cancel pending Summary: %w", err)
+		}
+		if cancelled {
+			return nil
+		}
+		detail, err = w.history.Recording(ctx, id)
+		if err != nil {
+			return fmt.Errorf("reload Summary after queue cancellation: %w", err)
+		}
+		if detail.SummaryStatus != recording.TranscriptionRunning {
+			return fmt.Errorf("cancel Summary: work changed before cancellation (currently %s)", detail.SummaryStatus)
+		}
+		fallthrough
+	case recording.TranscriptionRunning:
+		cancelled, err := w.history.TransitionSummaryAttempt(ctx, detail.ID, detail.SummaryAttempt, recording.TranscriptionCancelled, recording.ProcessingFailureCancelled, "Summary was cancelled.")
+		if err != nil {
+			return fmt.Errorf("cancel running Summary: %w", err)
+		}
+		if !cancelled {
+			return fmt.Errorf("cancel Summary: work changed before cancellation")
+		}
+		w.processingMu.Lock()
+		if w.runningID == detail.ID && w.runningAttempt == detail.SummaryAttempt && w.runningCancel != nil {
+			w.runningCancelledByUser = true
+			w.runningCancel()
+		}
+		w.processingMu.Unlock()
+		return nil
+	default:
+		return fmt.Errorf("cancel Summary: no queued Summary for Recording %q", id)
 	}
 }
 
@@ -608,7 +687,10 @@ func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
 				break
 			}
 			if completed == nil {
-				break
+				if !w.runSummary(ctx) {
+					break
+				}
+				continue
 			}
 			if _, err := os.Stat(completed.AudioPath); err != nil {
 				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionFailed, recording.ProcessingFailureExecution, "Recording audio is unavailable. Restore the audio file and try again.")
@@ -641,7 +723,9 @@ func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
 				category, detail := transcriptionFailure(runErr)
 				_, _ = w.history.TransitionTranscriptionAttempt(context.Background(), completed.ID, completed.TranscriptionAttempt, recording.TranscriptionFailed, category, detail)
 			} else {
-				_, _ = w.history.CompleteTranscriptionAttempt(runCtx, completed.ID, completed.TranscriptionAttempt, segments)
+				if saved, _ := w.history.CompleteTranscriptionAttempt(runCtx, completed.ID, completed.TranscriptionAttempt, segments); saved {
+					_ = w.history.QueueSummary(context.Background(), completed.ID)
+				}
 			}
 			cancel()
 			w.processingMu.Lock()
@@ -650,6 +734,59 @@ func (w *Workflow) runTranscriptionWorker(ctx context.Context) {
 			w.processingMu.Unlock()
 		}
 	}
+}
+
+func (w *Workflow) runSummary(ctx context.Context) bool {
+	completed, err := w.history.ClaimNextPendingSummary(ctx)
+	if err != nil || completed == nil {
+		return false
+	}
+	detail, err := w.history.Recording(ctx, completed.ID)
+	if err != nil {
+		return true
+	}
+	parts := make([]string, 0, len(detail.Transcription))
+	for _, segment := range detail.Transcription {
+		parts = append(parts, segment.Text)
+	}
+	w.processingMu.Lock()
+	if w.processingPaused {
+		w.processingMu.Unlock()
+		_, _ = w.history.TransitionSummaryAttempt(context.Background(), completed.ID, completed.SummaryAttempt, recording.TranscriptionPending, "", "")
+		return false
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = cancel, done, completed.ID, completed.SummaryAttempt, false
+	w.processingMu.Unlock()
+	result, runErr := w.summarizer.Summarize(runCtx, strings.Join(parts, "\n"))
+	w.processingMu.Lock()
+	cancelledByUser := w.runningCancelledByUser
+	w.processingMu.Unlock()
+	if runCtx.Err() != nil && cancelledByUser {
+		_, _ = w.history.TransitionSummaryAttempt(context.Background(), completed.ID, completed.SummaryAttempt, recording.TranscriptionCancelled, recording.ProcessingFailureCancelled, "Summary was cancelled.")
+	} else if runCtx.Err() != nil {
+		_, _ = w.history.TransitionSummaryAttempt(context.Background(), completed.ID, completed.SummaryAttempt, recording.TranscriptionPending, "", "")
+	} else if runErr != nil {
+		category, detail := summaryFailure(runErr)
+		_, _ = w.history.TransitionSummaryAttempt(context.Background(), completed.ID, completed.SummaryAttempt, recording.TranscriptionFailed, category, detail)
+	} else {
+		defaultTitle := "Recording " + detail.StartedAt.Local().Format("2006-01-02 15:04")
+		_, _ = w.history.CompleteSummaryAttempt(runCtx, completed.ID, completed.SummaryAttempt, recording.Summary{Title: result.Title, Overview: result.Overview, Agreements: result.Agreements, ActionItems: result.ActionItems, Deadlines: result.Deadlines, OpenQuestions: result.OpenQuestions}, defaultTitle)
+	}
+	cancel()
+	w.processingMu.Lock()
+	w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = nil, nil, "", 0, false
+	close(done)
+	w.processingMu.Unlock()
+	return true
+}
+
+func summaryFailure(err error) (recording.ProcessingFailureCategory, string) {
+	if errors.Is(err, summary.ErrConfiguration) {
+		return recording.ProcessingFailureConfiguration, "Local summaries are not configured. Check the Ollama endpoint and model."
+	}
+	return recording.ProcessingFailureExecution, "Summary could not be completed. Try again."
 }
 
 func transcriptionFailure(err error) (recording.ProcessingFailureCategory, string) {

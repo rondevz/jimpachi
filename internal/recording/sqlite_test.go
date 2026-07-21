@@ -328,3 +328,74 @@ func TestSQLiteTracksTranscriptionStatusAndEnforcesSegmentParent(t *testing.T) {
 		t.Errorf("segments after Recording deletion = %d, want 0", remaining)
 	}
 }
+
+func TestSQLitePersistsSummaryAndDoesNotOverwriteEditedTitle(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	path := filepath.Join(t.TempDir(), "recording.opus")
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, Recording{ID: "recording-1", Title: "Recording 2026-07-20 10:00", StartedAt: time.Now(), AudioPath: path, TranscriptionStatus: TranscriptionSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueueSummary(ctx, "recording-1"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextPendingSummary(ctx)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextPendingSummary() = %#v, %v", claimed, err)
+	}
+	if err := store.Rename(ctx, "recording-1", "My edited title"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteSummaryAttempt(ctx, "recording-1", claimed.SummaryAttempt, Summary{Title: "Proposed title", Overview: "Overview", ActionItems: []string{"Deploy"}}, "Recording 2026-07-20 10:00"); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := store.Recording(ctx, "recording-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Title != "My edited title" || detail.Summary.Title != "Proposed title" || detail.SummaryStatus != TranscriptionSucceeded {
+		t.Errorf("Recording() = %#v", detail)
+	}
+	history, err := store.History(ctx)
+	if err != nil || len(history) != 1 || history[0].Summary.Title != "Proposed title" || len(history[0].Summary.ActionItems) != 1 {
+		t.Errorf("History() = %#v, %v", history, err)
+	}
+}
+
+func TestSQLiteCancelsOnlyUnclaimedSummary(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	path := filepath.Join(t.TempDir(), "recording.opus")
+	if err := os.WriteFile(path, []byte("opus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, Recording{ID: "recording-1", Title: "Instructions", StartedAt: time.Now(), AudioPath: path, TranscriptionStatus: TranscriptionSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueueSummary(ctx, "recording-1"); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := store.CancelQueuedSummary(ctx, "recording-1"); err != nil || !cancelled {
+		t.Fatalf("CancelQueuedSummary() = %t, %v", cancelled, err)
+	}
+	if err := store.QueueSummary(ctx, "recording-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextPendingSummary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := store.CancelQueuedSummary(ctx, "recording-1"); err != nil || cancelled {
+		t.Fatalf("CancelQueuedSummary() = %t, %v, want false, nil", cancelled, err)
+	}
+}

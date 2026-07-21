@@ -36,6 +36,8 @@ Jimpachi runs configured `whisper.cpp` locally with language auto-detection and 
 
 Post-processing is serial and its queued, active, failed, or cancelled state is visible in Recording history and detail. Recording has priority: starting a new capture pauses queued work and cancels the active attempt so it can resume afterward. Press `c` in a queued or active Recording detail view to cancel it; press `t` to retry a failed or cancelled attempt. Failures show a stable, user-safe category and guidance while preserving the Recording and any previous Transcription.
 
+After a successful Transcription, Jimpachi generates a local Summary with a proposed title, overview, agreements and decisions, action items, deadlines, and open questions when they are present. The proposed title applies only while the original timestamp title remains unchanged, so it cannot overwrite an edited title. Press `m` in Recording detail to generate or retry a Summary, or `c` while it is queued or running to cancel it. Ollama failures preserve the Recording and Transcription and show safe retry guidance.
+
 Configure the executable and model paths in `~/.config/jimpachi/config.toml`, or under `$XDG_CONFIG_HOME/jimpachi/config.toml` when `XDG_CONFIG_HOME` is set:
 
 ```toml
@@ -44,6 +46,10 @@ executable = "/home/me/whisper.cpp/build/bin/whisper-cli"
 model = "/home/me/whisper.cpp/models/ggml-small.bin"
 # Optional; defaults to 3.
 threads = 3
+
+[ollama]
+endpoint = "http://127.0.0.1:11434"
+model = "llama3.2"
 ```
 
 Jimpachi does not download models, install whisper.cpp, or modify `PATH`. If the paths are absent or invalid, manual transcription reports the local setup error and the Recording audio remains unchanged.

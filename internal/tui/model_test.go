@@ -85,6 +85,47 @@ func TestModelShowsFullTimestampedTranscriptionInRecordingDetail(t *testing.T) {
 	}
 }
 
+func TestModelShowsStructuredSummaryAndRetryControl(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionSucceeded, SummaryStatus: recording.TranscriptionFailed, SummaryError: "Summary could not be completed. Try again."}
+	view := model.View()
+	if !strings.Contains(view, "Summary failed: Summary could not be completed. Try again.") || !strings.Contains(view, "m to retry Summary") {
+		t.Errorf("View() = %q", view)
+	}
+	model.detail.SummaryStatus = recording.TranscriptionSucceeded
+	model.detail.Summary = recording.Summary{Overview: "Release Friday.", ActionItems: []string{"Test release"}, OpenQuestions: []string{"Who approves?"}}
+	view = model.View()
+	for _, want := range []string{"Release Friday.", "Action items: Test release", "Open questions: Who approves?"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() = %q, want %q", view, want)
+		}
+	}
+}
+
+func TestModelDoesNotOfferOrRequestSummaryBeforeTranscriptionSucceeds(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionFailed}
+	if strings.Contains(model.View(), "m to") {
+		t.Errorf("View() = %q, offered Summary before Transcription", model.View())
+	}
+	_, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	if command != nil {
+		t.Fatal("m requested a Summary before Transcription succeeded")
+	}
+}
+
+func TestModelCancelsQueuedSummary(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionSucceeded, SummaryStatus: recording.TranscriptionPending}
+	_, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if command == nil {
+		t.Fatal("cancellation key did not issue a Summary cancellation")
+	}
+	if _, ok := command().(transcriptionCancelled); !ok {
+		t.Fatalf("cancellation command message = %T", command())
+	}
+}
+
 func TestModelShowsFailedTranscriptionAndStopsPolling(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionFailed, TranscriptionError: "Transcription could not be completed."}
@@ -711,12 +752,18 @@ func (f fakeHistory) RequestTranscription(_ context.Context, id string) (recordi
 	return f.Recording(context.Background(), id)
 }
 
+func (f fakeHistory) RequestSummary(_ context.Context, id string) (recording.Recording, error) {
+	return f.Recording(context.Background(), id)
+}
+
 func (f fakeHistory) CancelTranscription(_ context.Context, id string) error {
 	if f.cancelled != nil {
 		*f.cancelled = id
 	}
 	return nil
 }
+
+func (f fakeHistory) CancelSummary(context.Context, string) error { return nil }
 
 func sameDurations(got, want []time.Duration) bool {
 	if len(got) != len(want) {
@@ -784,4 +831,10 @@ func (f blockingHistory) RequestTranscription(context.Context, string) (recordin
 	return recording.Recording{}, nil
 }
 
+func (f blockingHistory) RequestSummary(context.Context, string) (recording.Recording, error) {
+	return recording.Recording{}, nil
+}
+
 func (f blockingHistory) CancelTranscription(context.Context, string) error { return nil }
+
+func (f blockingHistory) CancelSummary(context.Context, string) error { return nil }

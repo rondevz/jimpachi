@@ -30,7 +30,9 @@ type Workflow interface {
 	SetAutomaticTranscription(context.Context, bool) error
 	Recording(context.Context, string) (recording.Recording, error)
 	RequestTranscription(context.Context, string) (recording.Recording, error)
+	RequestSummary(context.Context, string) (recording.Recording, error)
 	CancelTranscription(context.Context, string) error
+	CancelSummary(context.Context, string) error
 }
 
 // Model renders Jimpachi's Recording history.
@@ -66,6 +68,7 @@ type Model struct {
 	savingLimit     time.Duration
 	warning         string
 	transcribing    bool
+	summarizing     bool
 	cancelling      bool
 	automatic       bool
 	historyFocused  bool
@@ -231,7 +234,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.err == nil {
 			m.detail = &message.recording
 		}
-		if (m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning) && !m.transcribing {
+		if ((m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning) && !m.transcribing) || ((m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) && !m.summarizing) {
 			return m, m.transcriptionTick()
 		}
 		return m, nil
@@ -251,10 +254,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail = &message.recording
 		m.replaceHistoryRecording(message.recording)
-		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning {
+		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning || message.recording.SummaryStatus == recording.TranscriptionPending || message.recording.SummaryStatus == recording.TranscriptionRunning {
 			return m, m.transcriptionTick()
 		}
 		return m, nil
+	case summaryRequested:
+		m.summarizing = false
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.detail = &message.recording
+		m.replaceHistoryRecording(message.recording)
+		return m, m.transcriptionTick()
 	case transcriptionCancelled:
 		m.cancelling = false
 		if message.err != nil {
@@ -273,7 +285,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.detail = &message.recording
-		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning {
+		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning || message.recording.SummaryStatus == recording.TranscriptionPending || message.recording.SummaryStatus == recording.TranscriptionRunning {
 			return m, m.transcriptionTick()
 		}
 		return m, nil
@@ -402,10 +414,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.transcribing = true
 				return m, m.requestTranscription(m.detail.ID)
 			}
+		case "m":
+			if m.detail != nil && m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && !m.summarizing && m.detail.SummaryStatus != recording.TranscriptionPending && m.detail.SummaryStatus != recording.TranscriptionRunning {
+				m.summarizing = true
+				return m, m.requestSummary(m.detail.ID)
+			}
 		case "c":
 			if m.detail != nil && !m.cancelling && (m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning) {
 				m.cancelling = true
 				return m, m.cancelTranscription(m.detail.ID)
+			}
+			if m.detail != nil && m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && !m.cancelling && (m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) {
+				m.cancelling = true
+				return m, m.cancelSummary(m.detail.ID)
 			}
 		case "p":
 			if m.active == nil && !m.startPending && !m.stopPending {
@@ -567,10 +588,39 @@ func (m Model) View() string {
 					fmt.Fprintf(&view, "[%s - %s] %s\n", formatTimestamp(segment.Start), formatTimestamp(segment.End), terminalText(segment.Text))
 				}
 			}
+			view.WriteString("\nSummary\n\n")
+			switch m.detail.SummaryStatus {
+			case recording.TranscriptionPending:
+				view.WriteString("Post-processing: summary queued.\n")
+			case recording.TranscriptionRunning:
+				view.WriteString("Post-processing: summarizing.\n")
+			case recording.TranscriptionFailed:
+				fmt.Fprintf(&view, "Summary failed: %s\n", terminalText(m.detail.SummaryError))
+			case recording.TranscriptionSucceeded:
+				if m.detail.Summary.Overview != "" {
+					fmt.Fprintf(&view, "%s\n", terminalText(m.detail.Summary.Overview))
+				}
+				for _, section := range []struct {
+					name   string
+					values []string
+				}{{"Agreements and decisions", m.detail.Summary.Agreements}, {"Action items", m.detail.Summary.ActionItems}, {"Deadlines", m.detail.Summary.Deadlines}, {"Open questions", m.detail.Summary.OpenQuestions}} {
+					if len(section.values) > 0 {
+						fmt.Fprintf(&view, "%s: %s\n", section.name, terminalText(strings.Join(section.values, "; ")))
+					}
+				}
+			default:
+				view.WriteString("No Summary yet.\n")
+			}
 			if m.detail.TranscriptionStatus == recording.TranscriptionFailed || m.detail.TranscriptionStatus == recording.TranscriptionCancelled {
-				view.WriteString("\nPress t to retry; e to edit title; esc returns to history.\n")
+				view.WriteString("\nPress t to retry transcription; e to edit title; esc returns to history.\n")
 			} else if m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning {
 				view.WriteString("\nPress c to cancel; e to edit title; esc returns to history.\n")
+			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) {
+				view.WriteString("\nPress c to cancel Summary; e to edit title; esc returns to history.\n")
+			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionFailed || m.detail.SummaryStatus == recording.TranscriptionCancelled) {
+				view.WriteString("\nPress m to retry Summary; e to edit title; esc returns to history.\n")
+			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded {
+				view.WriteString("\nPress t to transcribe; m to generate summary; e to edit title; esc returns to history.\n")
 			} else {
 				view.WriteString("\nPress t to transcribe; e to edit title; esc returns to history.\n")
 			}
@@ -604,6 +654,14 @@ func (m Model) View() string {
 			fmt.Fprintf(&view, "Post-processing: failed (%s)\n\n", terminalText(string(entry.TranscriptionFailureCategory)))
 		case recording.TranscriptionCancelled:
 			view.WriteString("Post-processing: cancelled\n\n")
+		}
+		switch entry.SummaryStatus {
+		case recording.TranscriptionPending:
+			view.WriteString("Post-processing: summary queued\n\n")
+		case recording.TranscriptionRunning:
+			view.WriteString("Post-processing: summarizing\n\n")
+		case recording.TranscriptionFailed:
+			fmt.Fprintf(&view, "Post-processing: summary failed (%s)\n\n", terminalText(string(entry.SummaryFailureCategory)))
 		}
 		if entry.AudioMissing {
 			view.WriteString("Audio file is missing.\n\n")
@@ -670,6 +728,10 @@ type transcriptionLoaded struct {
 	err       error
 }
 type transcriptionRequested struct {
+	recording recording.Recording
+	err       error
+}
+type summaryRequested struct {
 	recording recording.Recording
 	err       error
 }
@@ -751,7 +813,7 @@ func (m Model) processingTick() tea.Cmd {
 
 func hasActiveProcessing(recordings []recording.Recording) bool {
 	for _, entry := range recordings {
-		if entry.TranscriptionStatus == recording.TranscriptionPending || entry.TranscriptionStatus == recording.TranscriptionRunning {
+		if entry.TranscriptionStatus == recording.TranscriptionPending || entry.TranscriptionStatus == recording.TranscriptionRunning || entry.SummaryStatus == recording.TranscriptionPending || entry.SummaryStatus == recording.TranscriptionRunning {
 			return true
 		}
 	}
@@ -765,6 +827,13 @@ func (m Model) requestTranscription(id string) tea.Cmd {
 	}
 }
 
+func (m Model) requestSummary(id string) tea.Cmd {
+	return func() tea.Msg {
+		detail, err := m.workflow.RequestSummary(m.ctx, id)
+		return summaryRequested{recording: detail, err: err}
+	}
+}
+
 func (m Model) cancelTranscription(id string) tea.Cmd {
 	return func() tea.Msg {
 		if err := m.workflow.CancelTranscription(m.ctx, id); err != nil {
@@ -772,6 +841,16 @@ func (m Model) cancelTranscription(id string) tea.Cmd {
 		}
 		recording, err := m.workflow.Recording(m.ctx, id)
 		return transcriptionCancelled{id: id, recording: recording, err: err}
+	}
+}
+
+func (m Model) cancelSummary(id string) tea.Cmd {
+	return func() tea.Msg {
+		if err := m.workflow.CancelSummary(m.ctx, id); err != nil {
+			return transcriptionCancelled{id: id, err: err}
+		}
+		detail, err := m.workflow.Recording(m.ctx, id)
+		return transcriptionCancelled{id: id, recording: detail, err: err}
 	}
 }
 

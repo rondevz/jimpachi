@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"jimpachi/internal/audio"
 	"jimpachi/internal/recording"
+	"jimpachi/internal/summary"
 	"jimpachi/internal/transcription"
 )
 
@@ -75,6 +77,97 @@ func TestWorkflowAutomaticallyTranscribesCompletedRecording(t *testing.T) {
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func TestWorkflowAutomaticallyGeneratesSummaryAfterTranscription(t *testing.T) {
+	ctx := context.Background()
+	workflow, err := OpenWithAudioAndProcessors(ctx, t.TempDir(), fakeAudio{}, &fakeTranscriber{segments: []transcription.Segment{{Text: "Ship Friday."}}}, &fakeSummarizer{summary: summary.Summary{Title: "Release plan", Overview: "A Friday release."}})
+	if err != nil {
+		t.Fatalf("OpenWithAudioAndProcessors() error = %v", err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	if err := workflow.SelectAudioSource(ctx, audio.Source{ID: "speakers.monitor", Name: "Speakers"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workflow.StartRecording(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := workflow.StopRecording(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.SummaryStatus == recording.TranscriptionSucceeded {
+			if detail.Summary.Title != "Release plan" || detail.Title != "Release plan" {
+				t.Errorf("Summary/Title = %#v, %q", detail.Summary, detail.Title)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("Summary status = %q, want succeeded", detail.SummaryStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestWorkflowCancelsRunningSummaryWithAttemptOwnership(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	completed := saveCompletedRecording(t, dir, "recording-1")
+	store, err := recording.OpenSQLite(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, recording.Recording{ID: completed.ID, Title: completed.Title, StartedAt: completed.StartedAt, AudioPath: completed.AudioPath, TranscriptionStatus: recording.TranscriptionSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueueSummary(ctx, completed.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	summarizer := &blockingSummarizer{started: make(chan struct{})}
+	workflow, err := OpenWithAudioAndProcessors(ctx, dir, fakeAudio{}, &fakeTranscriber{}, summarizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	<-summarizer.started
+	if err := workflow.CancelSummary(ctx, completed.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		detail, err := workflow.Recording(ctx, completed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if detail.SummaryStatus == recording.TranscriptionCancelled {
+			if detail.SummaryFailureCategory != recording.ProcessingFailureCancelled {
+				t.Errorf("Summary failure = %q", detail.SummaryFailureCategory)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("Summary status = %q", detail.SummaryStatus)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestSummaryFailureClassifiesOllamaConfigurationErrors(t *testing.T) {
+	category, detail := summaryFailure(fmt.Errorf("run Ollama: %w", summary.ErrConfiguration))
+	if category != recording.ProcessingFailureConfiguration || detail != "Local summaries are not configured. Check the Ollama endpoint and model." {
+		t.Errorf("summaryFailure() = %q, %q", category, detail)
 	}
 }
 
@@ -1260,6 +1353,26 @@ type fakeAudio struct {
 type fakeTranscriber struct {
 	segments []transcription.Segment
 	err      error
+}
+
+type fakeSummarizer struct {
+	summary summary.Summary
+	err     error
+}
+
+func (f *fakeSummarizer) Summarize(context.Context, string) (summary.Summary, error) {
+	return f.summary, f.err
+}
+
+type blockingSummarizer struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingSummarizer) Summarize(ctx context.Context, _ string) (summary.Summary, error) {
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	return summary.Summary{}, ctx.Err()
 }
 
 func (f *fakeTranscriber) Transcribe(context.Context, string) ([]transcription.Segment, error) {
