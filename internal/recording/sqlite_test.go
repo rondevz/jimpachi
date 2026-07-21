@@ -353,18 +353,18 @@ func TestSQLitePersistsSummaryAndDoesNotOverwriteEditedTitle(t *testing.T) {
 	if err := store.Rename(ctx, "recording-1", "My edited title"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CompleteSummaryAttempt(ctx, "recording-1", claimed.SummaryAttempt, Summary{Title: "Proposed title", Overview: "Overview", ActionItems: []string{"Deploy"}}, "Recording 2026-07-20 10:00"); err != nil {
+	if _, err := store.CompleteSummaryAttempt(ctx, "recording-1", claimed.SummaryAttempt, Summary{Title: "Proposed title", Overview: "Overview", Suggestions: []string{"Use staging"}, ActionItems: []string{"Deploy"}}, "Recording 2026-07-20 10:00"); err != nil {
 		t.Fatal(err)
 	}
 	detail, err := store.Recording(ctx, "recording-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Title != "My edited title" || detail.Summary.Title != "Proposed title" || detail.SummaryStatus != TranscriptionSucceeded {
+	if detail.Title != "My edited title" || detail.Summary.Title != "Proposed title" || len(detail.Summary.Suggestions) != 1 || detail.SummaryStatus != TranscriptionSucceeded {
 		t.Errorf("Recording() = %#v", detail)
 	}
 	history, err := store.History(ctx)
-	if err != nil || len(history) != 1 || history[0].Summary.Title != "Proposed title" || len(history[0].Summary.ActionItems) != 1 {
+	if err != nil || len(history) != 1 || history[0].Summary.Title != "Proposed title" || len(history[0].Summary.Suggestions) != 1 || len(history[0].Summary.ActionItems) != 1 {
 		t.Errorf("History() = %#v, %v", history, err)
 	}
 }

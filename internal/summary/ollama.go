@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"jimpachi/internal/config"
 )
@@ -25,6 +26,7 @@ type Summary struct {
 	Title         string   `json:"title"`
 	Overview      string   `json:"overview"`
 	Agreements    []string `json:"agreements_decisions"`
+	Suggestions   []string `json:"suggestions"`
 	ActionItems   []string `json:"action_items"`
 	Deadlines     []string `json:"deadlines"`
 	OpenQuestions []string `json:"open_questions"`
@@ -47,7 +49,7 @@ func LoadConfiguredOllama() (Ollama, error) {
 }
 
 // Summarize generates a strictly structured local summary.
-func (o Ollama) Summarize(ctx context.Context, transcript string) (Summary, error) {
+func (o Ollama) Summarize(ctx context.Context, transcript string, progress func(int)) (Summary, error) {
 	if o.Endpoint == "" || o.Model == "" {
 		return Summary{}, fmt.Errorf("run Ollama: %w: endpoint and model must be configured", ErrConfiguration)
 	}
@@ -61,7 +63,7 @@ func (o Ollama) Summarize(ctx context.Context, transcript string) (Summary, erro
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"model": o.Model, "stream": false, "format": summarySchema(), "prompt": "Summarize the transcript according to the supplied JSON schema. Omit unavailable content as empty strings or arrays. Transcript:\n" + transcript})
+	body, _ := json.Marshal(map[string]any{"model": o.Model, "stream": true, "format": summarySchema(), "prompt": "Write a concise narrative overview explaining what the conversation was about and its context. Then identify only supported agreements or decisions, suggestions, action items, deadlines, and open questions according to the supplied JSON schema. The Recording is the source of truth and the Transcription may contain errors, so do not invent or overstate details. Omit unavailable content as empty arrays. Transcript:\n" + transcript})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(endpoint.String(), "/")+"/api/generate", bytes.NewReader(body))
 	if err != nil {
 		return Summary{}, fmt.Errorf("create Ollama request: %w", err)
@@ -80,20 +82,41 @@ func (o Ollama) Summarize(ctx context.Context, transcript string) (Summary, erro
 	if resp.StatusCode != http.StatusOK {
 		return Summary{}, fmt.Errorf("run Ollama: unexpected response")
 	}
-	var response struct {
-		Response string `json:"response"`
-	}
 	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&response); err != nil {
-		return Summary{}, fmt.Errorf("read Ollama response: %w", err)
+	var generated strings.Builder
+	generatedCharacters := 0
+	done := false
+	for {
+		var chunk struct {
+			Response string `json:"response"`
+			Done     bool   `json:"done"`
+			Error    string `json:"error"`
+		}
+		if err := decoder.Decode(&chunk); err == io.EOF {
+			break
+		} else if err != nil {
+			return Summary{}, fmt.Errorf("read Ollama response: %w", err)
+		}
+		if done {
+			return Summary{}, fmt.Errorf("read Ollama response: data followed terminal frame")
+		}
+		if chunk.Error != "" {
+			return Summary{}, fmt.Errorf("read Ollama response: generation failed")
+		}
+		generated.WriteString(chunk.Response)
+		generatedCharacters += utf8.RuneCountInString(chunk.Response)
+		if progress != nil {
+			progress(generatedCharacters)
+		}
+		done = chunk.Done
 	}
-	if err := requireEnd(decoder); err != nil {
-		return Summary{}, fmt.Errorf("read Ollama response: %w", err)
+	if !done {
+		return Summary{}, fmt.Errorf("read Ollama response: stream ended before completion")
 	}
-	if response.Response == "" {
+	if generated.Len() == 0 {
 		return Summary{}, fmt.Errorf("read Ollama response: summary is required")
 	}
-	return parseJSON([]byte(response.Response))
+	return parseJSON([]byte(generated.String()))
 }
 
 func summarySchema() map[string]any {
@@ -106,11 +129,12 @@ func summarySchema() map[string]any {
 			"title":                map[string]any{"type": "string", "minLength": 1},
 			"overview":             map[string]any{"type": "string"},
 			"agreements_decisions": stringArray(),
+			"suggestions":          stringArray(),
 			"action_items":         stringArray(),
 			"deadlines":            stringArray(),
 			"open_questions":       stringArray(),
 		},
-		"required":             []string{"title", "overview", "agreements_decisions", "action_items", "deadlines", "open_questions"},
+		"required":             []string{"title", "overview", "agreements_decisions", "suggestions", "action_items", "deadlines", "open_questions"},
 		"additionalProperties": false,
 	}
 }
@@ -124,7 +148,7 @@ func parseJSON(b []byte) (Summary, error) {
 	if err := requireEnd(decoder); err != nil {
 		return Summary{}, err
 	}
-	allowed := map[string]bool{"title": true, "overview": true, "agreements_decisions": true, "action_items": true, "deadlines": true, "open_questions": true}
+	allowed := map[string]bool{"title": true, "overview": true, "agreements_decisions": true, "suggestions": true, "action_items": true, "deadlines": true, "open_questions": true}
 	for key := range raw {
 		if !allowed[key] {
 			return Summary{}, fmt.Errorf("unexpected summary field %q", key)
@@ -161,6 +185,9 @@ func parseJSON(b []byte) (Summary, error) {
 		return Summary{}, err
 	}
 	if s.Agreements, err = decodeArray("agreements_decisions"); err != nil {
+		return Summary{}, err
+	}
+	if s.Suggestions, err = decodeArray("suggestions"); err != nil {
 		return Summary{}, err
 	}
 	if s.ActionItems, err = decodeArray("action_items"); err != nil {

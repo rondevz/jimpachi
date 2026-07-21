@@ -62,6 +62,17 @@ func TestMeterShowsQuietNonZeroAudioActivity(t *testing.T) {
 	}
 }
 
+func TestModelDoesNotPollPulseMonitorActivity(t *testing.T) {
+	source := audio.Source{ID: "output.monitor", Name: "Output monitor", Pulse: true}
+	model := load(t, New(context.Background(), fakeHistory{sources: []audio.Source{source}}))
+	if command := model.activityCommand(); command != nil {
+		t.Fatal("activityCommand() enabled Pulse monitor polling")
+	}
+	if view := model.View(); strings.Contains(view, "activity meter") || !strings.Contains(view, "> Output monitor\n") {
+		t.Errorf("View() = %q, want Pulse monitor without meter label", view)
+	}
+}
+
 func TestModelRequiresConfirmationBeforeDeletingRecording(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 	model.detail = &recording.Recording{ID: "recording-1", Title: "Instructions"}
@@ -150,11 +161,38 @@ func TestModelShowsStructuredSummaryAndRetryControl(t *testing.T) {
 		t.Errorf("View() = %q", view)
 	}
 	model.detail.SummaryStatus = recording.TranscriptionSucceeded
-	model.detail.Summary = recording.Summary{Overview: "Release Friday.", ActionItems: []string{"Test release"}, OpenQuestions: []string{"Who approves?"}}
+	model.detail.Summary = recording.Summary{Overview: "The conversation concerned a Friday release.", Suggestions: []string{"Use staging"}, ActionItems: []string{"Test release"}, OpenQuestions: []string{"Who approves?"}}
 	view = model.View()
-	for _, want := range []string{"Release Friday.", "Action items: Test release", "Open questions: Who approves?"} {
+	for _, want := range []string{"Auxiliary interpretation", "The conversation concerned a Friday release.", "Suggestions: Use staging", "Action items: Test release", "Open questions: Who approves?"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("View() = %q, want %q", view, want)
+		}
+	}
+}
+
+func TestModelWrapsSummaryToTerminalWidth(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{SummaryStatus: recording.TranscriptionSucceeded, Summary: recording.Summary{Overview: "This conversation was about preparing and safely deploying the Friday release."}}
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 32})
+	view := updated.View()
+	if !strings.Contains(view, "This conversation was about\npreparing and safely deploying\nthe Friday release.") {
+		t.Errorf("View() = %q, want wrapped Summary overview", view)
+	}
+}
+
+func TestWrapTextHonorsNarrowAndWideTerminalCells(t *testing.T) {
+	for _, test := range []struct {
+		text  string
+		width int
+		want  string
+	}{
+		{"abcdefghij", 4, "abcd\nefgh\nij"},
+		{"你好世界", 4, "你好\n世界"},
+		{"👩‍💻👩‍💻", 2, "👩‍💻\n👩‍💻"},
+		{"one two three", 7, "one two\nthree"},
+	} {
+		if got := wrapText(test.text, test.width); got != test.want {
+			t.Errorf("wrapText(%q, %d) = %q, want %q", test.text, test.width, got, test.want)
 		}
 	}
 }

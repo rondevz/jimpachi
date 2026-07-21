@@ -9,6 +9,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
+	"github.com/rivo/uniseg"
 
 	"jimpachi/internal/app"
 	"jimpachi/internal/audio"
@@ -85,6 +87,7 @@ type Model struct {
 	settingsInput   string
 	settingsSaving  bool
 	confirmDeletion bool
+	width           int
 }
 
 // New creates a terminal model backed by Recording history.
@@ -107,6 +110,9 @@ func (m Model) Init() tea.Cmd {
 // Update applies user input and Recording-history results.
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
+	case tea.WindowSizeMsg:
+		m.width = message.Width
+		return m, nil
 	case initialLoaded:
 		m.recordings = message.recordings
 		m.err = message.historyErr
@@ -646,7 +652,7 @@ func (m Model) View() string {
 				prefix = "> "
 			}
 			if index == m.sourceIndex {
-				fmt.Fprintf(&view, "%s%s %s\n", prefix, terminalText(source.Name), meter(m.activity))
+				fmt.Fprintf(&view, "%s%s%s\n", prefix, terminalText(source.Name), sourceActivityView(source, m.activity))
 			} else {
 				fmt.Fprintf(&view, "%s%s\n", prefix, terminalText(source.Name))
 			}
@@ -657,7 +663,7 @@ func (m Model) View() string {
 		fmt.Fprintf(&view, "Unable to measure Audio activity: %v\n\n", m.activityErr)
 	}
 	if m.active != nil {
-		fmt.Fprintf(&view, "RECORDING  %s  %s %s\n", time.Since(m.active.StartedAt).Round(time.Second), terminalText(m.active.Source.Name), meter(m.activity))
+		fmt.Fprintf(&view, "RECORDING  %s  %s%s\n", time.Since(m.active.StartedAt).Round(time.Second), terminalText(m.active.Source.Name), sourceActivityView(m.active.Source, m.activity))
 		if m.warning != "" {
 			fmt.Fprintf(&view, "%s\n", m.warning)
 		}
@@ -716,23 +722,28 @@ func (m Model) View() string {
 				}
 			}
 			view.WriteString("\nSummary\n\n")
+			fmt.Fprintf(&view, "%s\n", wrapText("Auxiliary interpretation; verify against the Transcription and Recording audio.", m.contentWidth()))
 			switch m.detail.SummaryStatus {
 			case recording.TranscriptionPending:
 				view.WriteString("Post-processing: summary queued.\n")
 			case recording.TranscriptionRunning:
-				view.WriteString("Post-processing: summarizing.\n")
+				if m.detail.SummaryProgress > 0 {
+					fmt.Fprintf(&view, "Post-processing: summarizing (%d characters generated).\n", m.detail.SummaryProgress)
+				} else {
+					view.WriteString("Post-processing: summarizing.\n")
+				}
 			case recording.TranscriptionFailed:
 				fmt.Fprintf(&view, "Summary failed: %s\n", terminalText(m.detail.SummaryError))
 			case recording.TranscriptionSucceeded:
 				if m.detail.Summary.Overview != "" {
-					fmt.Fprintf(&view, "%s\n", terminalText(m.detail.Summary.Overview))
+					fmt.Fprintf(&view, "%s\n", wrapText(terminalText(m.detail.Summary.Overview), m.contentWidth()))
 				}
 				for _, section := range []struct {
 					name   string
 					values []string
-				}{{"Agreements and decisions", m.detail.Summary.Agreements}, {"Action items", m.detail.Summary.ActionItems}, {"Deadlines", m.detail.Summary.Deadlines}, {"Open questions", m.detail.Summary.OpenQuestions}} {
+				}{{"Agreements and decisions", m.detail.Summary.Agreements}, {"Suggestions", m.detail.Summary.Suggestions}, {"Action items", m.detail.Summary.ActionItems}, {"Deadlines", m.detail.Summary.Deadlines}, {"Open questions", m.detail.Summary.OpenQuestions}} {
 					if len(section.values) > 0 {
-						fmt.Fprintf(&view, "%s: %s\n", section.name, terminalText(strings.Join(section.values, "; ")))
+						fmt.Fprintf(&view, "%s\n", wrapText(section.name+": "+terminalText(strings.Join(section.values, "; ")), m.contentWidth()))
 					}
 				}
 			default:
@@ -808,7 +819,11 @@ func (m Model) View() string {
 		case recording.TranscriptionPending:
 			view.WriteString("Post-processing: summary queued\n\n")
 		case recording.TranscriptionRunning:
-			view.WriteString("Post-processing: summarizing\n\n")
+			if entry.SummaryProgress > 0 {
+				fmt.Fprintf(&view, "Post-processing: summarizing (%d characters generated)\n\n", entry.SummaryProgress)
+			} else {
+				view.WriteString("Post-processing: summarizing\n\n")
+			}
 		case recording.TranscriptionFailed:
 			fmt.Fprintf(&view, "Post-processing: summary failed (%s)\n\n", terminalText(string(entry.SummaryFailureCategory)))
 		}
@@ -920,11 +935,21 @@ func (m Model) activityCommand() tea.Cmd {
 		return nil
 	}
 	source := m.sources[m.sourceIndex]
+	if source.Pulse {
+		return nil
+	}
 	generation := m.generation
 	return func() tea.Msg {
 		activity, err := m.workflow.AudioActivity(m.ctx, source)
 		return sourceActivity{sourceID: source.ID, generation: generation, activity: activity, err: err}
 	}
+}
+
+func sourceActivityView(source audio.Source, activity float64) string {
+	if source.Pulse {
+		return ""
+	}
+	return " " + meter(activity)
 }
 
 func (m Model) selectSource(source audio.Source, confirmation uint64) tea.Cmd {
@@ -1176,4 +1201,64 @@ func terminalText(text string) string {
 
 func formatTimestamp(value time.Duration) string {
 	return fmt.Sprintf("%02d:%02d:%02d", int(value.Hours()), int(value.Minutes())%60, int(value.Seconds())%60)
+}
+
+func (m Model) contentWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return 80
+}
+
+func wrapText(text string, width int) string {
+	if width < 1 {
+		return text
+	}
+	var lines []string
+	for paragraphIndex, paragraph := range strings.Split(text, "\n") {
+		if paragraphIndex > 0 {
+			lines = append(lines, "")
+		}
+		line := ""
+		for _, word := range strings.Fields(paragraph) {
+			for runewidth.StringWidth(word) > width {
+				if line != "" {
+					lines = append(lines, line)
+					line = ""
+				}
+				var prefix string
+				prefix, word = splitDisplayWidth(word, width)
+				lines = append(lines, prefix)
+			}
+			if word == "" {
+				continue
+			}
+			if line == "" {
+				line = word
+			} else if runewidth.StringWidth(line)+1+runewidth.StringWidth(word) <= width {
+				line += " " + word
+			} else {
+				lines = append(lines, line)
+				line = word
+			}
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func splitDisplayWidth(text string, width int) (string, string) {
+	used := 0
+	graphemes := uniseg.NewGraphemes(text)
+	for graphemes.Next() {
+		start, _ := graphemes.Positions()
+		characterWidth := runewidth.StringWidth(graphemes.Str())
+		if used > 0 && used+characterWidth > width {
+			return text[:start], text[start:]
+		}
+		used += characterWidth
+	}
+	return text, ""
 }

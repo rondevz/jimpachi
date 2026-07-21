@@ -230,6 +230,9 @@ func TestWorkflowCancelsRunningSummaryWithAttemptOwnership(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = workflow.Close() })
 	<-summarizer.started
+	if detail, err := workflow.Recording(ctx, completed.ID); err != nil || detail.SummaryProgress != 64 {
+		t.Fatalf("Recording() progress = %d, %v; want 64", detail.SummaryProgress, err)
+	}
 	if err := workflow.CancelSummary(ctx, completed.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -1476,7 +1479,10 @@ type fakeSummarizer struct {
 	err     error
 }
 
-func (f *fakeSummarizer) Summarize(context.Context, string) (summary.Summary, error) {
+func (f *fakeSummarizer) Summarize(_ context.Context, _ string, progress func(int)) (summary.Summary, error) {
+	if progress != nil {
+		progress(128)
+	}
 	return f.summary, f.err
 }
 
@@ -1485,8 +1491,11 @@ type blockingSummarizer struct {
 	once    sync.Once
 }
 
-func (f *blockingSummarizer) Summarize(ctx context.Context, _ string) (summary.Summary, error) {
+func (f *blockingSummarizer) Summarize(ctx context.Context, _ string, progress func(int)) (summary.Summary, error) {
 	f.once.Do(func() { close(f.started) })
+	if progress != nil {
+		progress(64)
+	}
 	<-ctx.Done()
 	return summary.Summary{}, ctx.Err()
 }

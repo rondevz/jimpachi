@@ -46,6 +46,7 @@ type Workflow struct {
 	runningAttempt           uint64
 	runningCancelledByUser   bool
 	processingPaused         bool
+	summaryProgress          map[string]int
 }
 
 // Transcriber is the external local speech-to-text boundary used by Workflow.
@@ -55,7 +56,7 @@ type Transcriber interface {
 
 // Summarizer is the external local text-summary boundary used by Workflow.
 type Summarizer interface {
-	Summarize(context.Context, string) (summary.Summary, error)
+	Summarize(context.Context, string, func(int)) (summary.Summary, error)
 }
 
 // Opener reveals a local Recording audio file with the desktop's configured application.
@@ -159,7 +160,7 @@ func open(ctx context.Context, dataDir string, adapter audio.Adapter, transcribe
 		return nil, fmt.Errorf("recover interrupted Recordings: %w", err)
 	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, summarizer: summarizer, scheduler: scheduler, opener: desktopOpener{}, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1)}
+	workflow := &Workflow{history: history, audio: adapter, transcriber: transcriber, summarizer: summarizer, scheduler: scheduler, opener: desktopOpener{}, recoveryWarning: history.RecoveryWarning(), limitStopTimeout: 5 * time.Second, workerCancel: workerCancel, workerWake: make(chan struct{}, 1), summaryProgress: make(map[string]int)}
 	workflow.workerWG.Add(1)
 	go workflow.runTranscriptionWorker(workerCtx)
 	if err := history.ResetRunningTranscriptions(ctx); err != nil {
@@ -755,6 +756,9 @@ func (w *Workflow) Recording(ctx context.Context, id string) (recording.Recordin
 	if err != nil {
 		return recording.Recording{}, fmt.Errorf("load workflow Recording: %w", err)
 	}
+	w.processingMu.Lock()
+	detail.SummaryProgress = w.summaryProgress[id]
+	w.processingMu.Unlock()
 	return detail, nil
 }
 
@@ -883,11 +887,18 @@ func (w *Workflow) runSummary(ctx context.Context) bool {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = cancel, done, completed.ID, completed.SummaryAttempt, false
+	w.summaryProgress[completed.ID] = 0
 	w.processingMu.Unlock()
 	w.processingMu.Lock()
 	summarizer := w.summarizer
 	w.processingMu.Unlock()
-	result, runErr := summarizer.Summarize(runCtx, strings.Join(parts, "\n"))
+	result, runErr := summarizer.Summarize(runCtx, strings.Join(parts, "\n"), func(generated int) {
+		w.processingMu.Lock()
+		if w.runningID == completed.ID && w.runningAttempt == completed.SummaryAttempt {
+			w.summaryProgress[completed.ID] = generated
+		}
+		w.processingMu.Unlock()
+	})
 	w.processingMu.Lock()
 	cancelledByUser := w.runningCancelledByUser
 	w.processingMu.Unlock()
@@ -900,11 +911,12 @@ func (w *Workflow) runSummary(ctx context.Context) bool {
 		_, _ = w.history.TransitionSummaryAttempt(context.Background(), completed.ID, completed.SummaryAttempt, recording.TranscriptionFailed, category, detail)
 	} else {
 		defaultTitle := "Recording " + detail.StartedAt.Local().Format("2006-01-02 15:04")
-		_, _ = w.history.CompleteSummaryAttempt(runCtx, completed.ID, completed.SummaryAttempt, recording.Summary{Title: result.Title, Overview: result.Overview, Agreements: result.Agreements, ActionItems: result.ActionItems, Deadlines: result.Deadlines, OpenQuestions: result.OpenQuestions}, defaultTitle)
+		_, _ = w.history.CompleteSummaryAttempt(runCtx, completed.ID, completed.SummaryAttempt, recording.Summary{Title: result.Title, Overview: result.Overview, Agreements: result.Agreements, Suggestions: result.Suggestions, ActionItems: result.ActionItems, Deadlines: result.Deadlines, OpenQuestions: result.OpenQuestions}, defaultTitle)
 	}
 	cancel()
 	w.processingMu.Lock()
 	w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = nil, nil, "", 0, false
+	delete(w.summaryProgress, completed.ID)
 	close(done)
 	w.processingMu.Unlock()
 	return true
@@ -1044,6 +1056,11 @@ func (w *Workflow) History(ctx context.Context) ([]recording.Recording, error) {
 		return nil, fmt.Errorf("load workflow Recording history: %w", err)
 	}
 
+	w.processingMu.Lock()
+	for index := range history {
+		history[index].SummaryProgress = w.summaryProgress[history[index].ID]
+	}
+	w.processingMu.Unlock()
 	return history, nil
 }
 

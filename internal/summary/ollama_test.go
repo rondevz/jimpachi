@@ -13,6 +13,7 @@ import (
 func TestOllamaRequestsStringArraysWithJSONSchema(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
+			Stream bool `json:"stream"`
 			Format struct {
 				Type       string   `json:"type"`
 				Required   []string `json:"required"`
@@ -31,8 +32,11 @@ func TestOllamaRequestsStringArraysWithJSONSchema(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if request.Format.Type != "object" || len(request.Format.Properties) != 6 {
-			t.Errorf("format root = %#v, want object with six properties", request.Format)
+		if request.Format.Type != "object" || len(request.Format.Properties) != 7 {
+			t.Errorf("format root = %#v, want object with seven properties", request.Format)
+		}
+		if !request.Stream {
+			t.Error("stream = false, want streamed Ollama response")
 		}
 		if request.Format.Additional == nil || *request.Format.Additional {
 			t.Errorf("additionalProperties = %v, want false", request.Format.Additional)
@@ -41,7 +45,7 @@ func TestOllamaRequestsStringArraysWithJSONSchema(t *testing.T) {
 		for _, field := range request.Format.Required {
 			required[field] = true
 		}
-		for _, field := range []string{"title", "overview", "agreements_decisions", "action_items", "deadlines", "open_questions"} {
+		for _, field := range []string{"title", "overview", "agreements_decisions", "suggestions", "action_items", "deadlines", "open_questions"} {
 			if !required[field] {
 				t.Errorf("required = %#v, missing %q", request.Format.Required, field)
 			}
@@ -49,23 +53,55 @@ func TestOllamaRequestsStringArraysWithJSONSchema(t *testing.T) {
 		if title, overview := request.Format.Properties["title"], request.Format.Properties["overview"]; title.Type != "string" || title.MinLength != 1 || overview.Type != "string" {
 			t.Errorf("title/overview schema = %#v, %#v", title, overview)
 		}
-		for _, field := range []string{"agreements_decisions", "action_items", "deadlines", "open_questions"} {
+		for _, field := range []string{"agreements_decisions", "suggestions", "action_items", "deadlines", "open_questions"} {
 			property := request.Format.Properties[field]
 			if property.Type != "array" || property.Items.Type != "string" {
 				t.Errorf("format property %q = %#v, want array of strings", field, property)
 			}
 		}
-		_, _ = w.Write([]byte(`{"response":"{\"title\":\"Plan\",\"overview\":\"\",\"agreements_decisions\":[],\"action_items\":[],\"deadlines\":[],\"open_questions\":[]}"}`))
+		_, _ = w.Write([]byte(`{"response":"{\"title\":\"Plan\",\"overview\":\"\",\"agreements_decisions\":[],\"suggestions\":[],\"action_items\":[],\"deadlines\":[],\"open_questions\":[]}","done":true}`))
 	}))
 	defer server.Close()
-	if _, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript"); err != nil {
+	if _, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript", nil); err != nil {
 		t.Fatalf("Summarize() error = %v", err)
+	}
+}
+
+func TestOllamaStreamsGenerationProgressAndCombinesChunks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{\"response\":\"{\\\"title\\\":\\\"Plan\\\",\\\"overview\\\":\\\"Narración.\\\",\\\"agreements_decisions\\\":[],\",\"done\":false}\n"))
+		_, _ = w.Write([]byte("{\"response\":\"\\\"suggestions\\\":[],\\\"action_items\\\":[],\\\"deadlines\\\":[],\\\"open_questions\\\":[]}\",\"done\":true}\n"))
+	}))
+	defer server.Close()
+	var progress []int
+	result, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript", func(generated int) {
+		progress = append(progress, generated)
+	})
+	if err != nil {
+		t.Fatalf("Summarize() error = %v", err)
+	}
+	if result.Overview != "Narración." || len(progress) != 2 || progress[1] <= progress[0] || progress[0] != len([]rune(`{"title":"Plan","overview":"Narración.","agreements_decisions":[],`)) {
+		t.Errorf("Summarize() = %#v, progress = %#v", result, progress)
+	}
+}
+
+func TestOllamaRejectsIncompleteAndErrorStreams(t *testing.T) {
+	for _, response := range []string{
+		`{"response":"{\"title\":\"truncated\"}"}` + "\n",
+		`{"error":"model failed","done":true}` + "\n",
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(response)) }))
+		_, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript", nil)
+		server.Close()
+		if err == nil {
+			t.Errorf("Summarize() error = nil for stream %q", response)
+		}
 	}
 }
 
 func TestOllamaClassifiesInvalidEndpointAsConfigurationError(t *testing.T) {
 	for _, endpoint := range []string{"http://example.com", "://bad"} {
-		_, err := (Ollama{Endpoint: endpoint, Model: "local"}).Summarize(context.Background(), "private transcript")
+		_, err := (Ollama{Endpoint: endpoint, Model: "local"}).Summarize(context.Background(), "private transcript", nil)
 		if !errors.Is(err, ErrConfiguration) {
 			t.Errorf("Summarize(%q) error = %v, want configuration error", endpoint, err)
 		}
@@ -73,7 +109,7 @@ func TestOllamaClassifiesInvalidEndpointAsConfigurationError(t *testing.T) {
 }
 
 func TestParseJSONReadsStructuredOllamaSummary(t *testing.T) {
-	s, err := parseJSON([]byte(`{"title":"Release plan","overview":"Discussed release.","agreements_decisions":["Ship Friday"],"action_items":["Test"],"deadlines":["Friday"],"open_questions":[]}`))
+	s, err := parseJSON([]byte(`{"title":"Release plan","overview":"Discussed release.","agreements_decisions":["Ship Friday"],"suggestions":["Use staging"],"action_items":["Test"],"deadlines":["Friday"],"open_questions":[]}`))
 	if err != nil {
 		t.Fatalf("parseJSON() error = %v", err)
 	}
@@ -83,7 +119,7 @@ func TestParseJSONReadsStructuredOllamaSummary(t *testing.T) {
 }
 
 func TestParseJSONRejectsUnknownAndMissingStructuredFields(t *testing.T) {
-	for _, contents := range []string{`{"title":"Plan","overview":"Overview","agreements_decisions":[],"action_items":[],"deadlines":[],"open_questions":[],"extra":true}`, `{"title":"Plan"}`, `{"title":"Plan","overview":"Overview","agreements_decisions":null,"action_items":[],"deadlines":[],"open_questions":[]}`, `{"title":"Plan","overview":"Overview","agreements_decisions":[],"action_items":[],"deadlines":[],"open_questions":[]} trailing`, `{"title":`} {
+	for _, contents := range []string{`{"title":"Plan","overview":"Overview","agreements_decisions":[],"suggestions":[],"action_items":[],"deadlines":[],"open_questions":[],"extra":true}`, `{"title":"Plan"}`, `{"title":"Plan","overview":"Overview","agreements_decisions":null,"suggestions":[],"action_items":[],"deadlines":[],"open_questions":[]}`, `{"title":"Plan","overview":"Overview","agreements_decisions":[],"suggestions":[],"action_items":[],"deadlines":[],"open_questions":[]} trailing`, `{"title":`} {
 		if _, err := parseJSON([]byte(contents)); err == nil {
 			t.Errorf("parseJSON(%s) error = nil", contents)
 		}
@@ -91,7 +127,7 @@ func TestParseJSONRejectsUnknownAndMissingStructuredFields(t *testing.T) {
 }
 
 func TestOllamaRejectsRemoteEndpoint(t *testing.T) {
-	if _, err := (Ollama{Endpoint: "http://example.com", Model: "local"}).Summarize(context.Background(), "private transcript"); err == nil {
+	if _, err := (Ollama{Endpoint: "http://example.com", Model: "local"}).Summarize(context.Background(), "private transcript", nil); err == nil {
 		t.Fatal("Summarize() error = nil")
 	}
 }
@@ -101,7 +137,7 @@ func TestOllamaRejectsRedirect(t *testing.T) {
 		http.Redirect(w, r, "http://example.com", http.StatusFound)
 	}))
 	defer server.Close()
-	if _, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript"); err == nil {
+	if _, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript", nil); err == nil {
 		t.Fatal("Summarize() error = nil")
 	}
 }
@@ -117,7 +153,7 @@ func TestOllamaTimesOutHungRequest(t *testing.T) {
 	defer server.Close()
 	defer close(cleanup)
 	started := time.Now()
-	_, err := (Ollama{Endpoint: server.URL, Model: "local", RequestTimeout: 10 * time.Millisecond}).Summarize(context.Background(), "private transcript")
+	_, err := (Ollama{Endpoint: server.URL, Model: "local", RequestTimeout: 10 * time.Millisecond}).Summarize(context.Background(), "private transcript", nil)
 	if err == nil || time.Since(started) > time.Second {
 		t.Fatalf("Summarize() = %v after %s", err, time.Since(started))
 	}

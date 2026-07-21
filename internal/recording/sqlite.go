@@ -35,12 +35,13 @@ type Recording struct {
 	SummaryError                 string
 	SummaryQueuedAt              time.Time
 	SummaryAttempt               uint64
+	SummaryProgress              int
 }
 
 // Summary is the structured derived quick view of a Transcription.
 type Summary struct {
-	Title, Overview                                   string
-	Agreements, ActionItems, Deadlines, OpenQuestions []string
+	Title, Overview                                                string
+	Agreements, Suggestions, ActionItems, Deadlines, OpenQuestions []string
 }
 
 // TranscriptionStatus reports the durable state of derived local text.
@@ -124,6 +125,7 @@ func (s *SQLite) initialize(ctx context.Context) error {
 			, summary_title TEXT NOT NULL DEFAULT ''
 			, summary_overview TEXT NOT NULL DEFAULT ''
 			, summary_agreements TEXT NOT NULL DEFAULT '[]'
+			, summary_suggestions TEXT NOT NULL DEFAULT '[]'
 			, summary_action_items TEXT NOT NULL DEFAULT '[]'
 			, summary_deadlines TEXT NOT NULL DEFAULT '[]'
 			, summary_open_questions TEXT NOT NULL DEFAULT '[]'
@@ -177,7 +179,7 @@ func (s *SQLite) initialize(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE recordings SET transcription_status = ? WHERE transcription_status = ? AND transcription_queued_at_unix_ns = 0`, TranscriptionNotQueued, TranscriptionPending); err != nil {
 		return fmt.Errorf("migrate unqueued Transcriptions: %w", err)
 	}
-	for _, column := range []string{"summary_title TEXT NOT NULL DEFAULT ''", "summary_overview TEXT NOT NULL DEFAULT ''", "summary_agreements TEXT NOT NULL DEFAULT '[]'", "summary_action_items TEXT NOT NULL DEFAULT '[]'", "summary_deadlines TEXT NOT NULL DEFAULT '[]'", "summary_open_questions TEXT NOT NULL DEFAULT '[]'", "summary_status TEXT NOT NULL DEFAULT 'not_queued'", "summary_failure_category TEXT NOT NULL DEFAULT ''", "summary_error TEXT NOT NULL DEFAULT ''", "summary_queued_at_unix_ns INTEGER NOT NULL DEFAULT 0", "summary_attempt INTEGER NOT NULL DEFAULT 0"} {
+	for _, column := range []string{"summary_title TEXT NOT NULL DEFAULT ''", "summary_overview TEXT NOT NULL DEFAULT ''", "summary_agreements TEXT NOT NULL DEFAULT '[]'", "summary_suggestions TEXT NOT NULL DEFAULT '[]'", "summary_action_items TEXT NOT NULL DEFAULT '[]'", "summary_deadlines TEXT NOT NULL DEFAULT '[]'", "summary_open_questions TEXT NOT NULL DEFAULT '[]'", "summary_status TEXT NOT NULL DEFAULT 'not_queued'", "summary_failure_category TEXT NOT NULL DEFAULT ''", "summary_error TEXT NOT NULL DEFAULT ''", "summary_queued_at_unix_ns INTEGER NOT NULL DEFAULT 0", "summary_attempt INTEGER NOT NULL DEFAULT 0"} {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE recordings ADD COLUMN `+column); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("add Summary state: %w", err)
 		}
@@ -246,7 +248,7 @@ func (s *SQLite) ClaimNextPendingSummary(ctx context.Context) (*Recording, error
 // CompleteSummaryAttempt persists a Summary and applies its proposed title only while the default title remains unchanged.
 func (s *SQLite) CompleteSummaryAttempt(ctx context.Context, id string, attempt uint64, summary Summary, defaultTitle string) (bool, error) {
 	encode := func(v []string) string { b, _ := json.Marshal(v); return string(b) }
-	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET summary_title=?,summary_overview=?,summary_agreements=?,summary_action_items=?,summary_deadlines=?,summary_open_questions=?,summary_status=?,summary_failure_category='',summary_error='',summary_queued_at_unix_ns=0,title=CASE WHEN title=? THEN ? ELSE title END WHERE id=? AND summary_status=? AND summary_attempt=?`, summary.Title, summary.Overview, encode(summary.Agreements), encode(summary.ActionItems), encode(summary.Deadlines), encode(summary.OpenQuestions), TranscriptionSucceeded, defaultTitle, summary.Title, id, TranscriptionRunning, attempt)
+	result, err := s.db.ExecContext(ctx, `UPDATE recordings SET summary_title=?,summary_overview=?,summary_agreements=?,summary_suggestions=?,summary_action_items=?,summary_deadlines=?,summary_open_questions=?,summary_status=?,summary_failure_category='',summary_error='',summary_queued_at_unix_ns=0,title=CASE WHEN title=? THEN ? ELSE title END WHERE id=? AND summary_status=? AND summary_attempt=?`, summary.Title, summary.Overview, encode(summary.Agreements), encode(summary.Suggestions), encode(summary.ActionItems), encode(summary.Deadlines), encode(summary.OpenQuestions), TranscriptionSucceeded, defaultTitle, summary.Title, id, TranscriptionRunning, attempt)
 	if err != nil {
 		return false, fmt.Errorf("complete Summary for Recording %q: %w", id, err)
 	}
@@ -660,7 +662,7 @@ func (s *SQLite) completePromotion(ctx context.Context, id string) error {
 // History returns Recordings ordered from newest to oldest.
 func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_failure_category, transcription_error, transcription_queued_at_unix_ns, transcription_attempt, summary_title, summary_overview, summary_agreements, summary_action_items, summary_deadlines, summary_open_questions, summary_status, summary_failure_category, summary_error, summary_queued_at_unix_ns, summary_attempt
+		SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_failure_category, transcription_error, transcription_queued_at_unix_ns, transcription_attempt, summary_title, summary_overview, summary_agreements, summary_suggestions, summary_action_items, summary_deadlines, summary_open_questions, summary_status, summary_failure_category, summary_error, summary_queued_at_unix_ns, summary_attempt
 		FROM recordings
 		ORDER BY started_at_unix_ns DESC, id DESC
 	`)
@@ -673,15 +675,15 @@ func (s *SQLite) History(ctx context.Context) ([]Recording, error) {
 	for rows.Next() {
 		var recording Recording
 		var startedAt, duration, queuedAt, summaryQueuedAt int64
-		var agreements, actions, deadlines, questions string
-		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion, &recording.Interrupted, &recording.TranscriptionStatus, &recording.TranscriptionFailureCategory, &recording.TranscriptionError, &queuedAt, &recording.TranscriptionAttempt, &recording.Summary.Title, &recording.Summary.Overview, &agreements, &actions, &deadlines, &questions, &recording.SummaryStatus, &recording.SummaryFailureCategory, &recording.SummaryError, &summaryQueuedAt, &recording.SummaryAttempt); err != nil {
+		var agreements, suggestions, actions, deadlines, questions string
+		if err := rows.Scan(&recording.ID, &recording.Title, &startedAt, &duration, &recording.AudioPath, &recording.PendingPromotion, &recording.Interrupted, &recording.TranscriptionStatus, &recording.TranscriptionFailureCategory, &recording.TranscriptionError, &queuedAt, &recording.TranscriptionAttempt, &recording.Summary.Title, &recording.Summary.Overview, &agreements, &suggestions, &actions, &deadlines, &questions, &recording.SummaryStatus, &recording.SummaryFailureCategory, &recording.SummaryError, &summaryQueuedAt, &recording.SummaryAttempt); err != nil {
 			return nil, fmt.Errorf("read Recording history: %w", err)
 		}
 
 		recording.StartedAt = time.Unix(0, startedAt).UTC()
 		recording.Duration = time.Duration(duration)
 		recording.TranscriptionQueuedAt = time.Unix(0, queuedAt).UTC()
-		if err := decodeSummary(&recording, agreements, actions, deadlines, questions, summaryQueuedAt); err != nil {
+		if err := decodeSummary(&recording, agreements, suggestions, actions, deadlines, questions, summaryQueuedAt); err != nil {
 			return nil, err
 		}
 		if _, err := os.Stat(recording.AudioPath); os.IsNotExist(err) {
@@ -704,8 +706,8 @@ func (s *SQLite) Recording(ctx context.Context, id string) (Recording, error) {
 	var startedAt, duration int64
 	var queuedAt int64
 	var summaryQueuedAt int64
-	var agreements, actions, deadlines, questions string
-	err := s.db.QueryRowContext(ctx, `SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_failure_category, transcription_error, transcription_queued_at_unix_ns, transcription_attempt, summary_title, summary_overview, summary_agreements, summary_action_items, summary_deadlines, summary_open_questions, summary_status, summary_failure_category, summary_error, summary_queued_at_unix_ns, summary_attempt FROM recordings WHERE id = ?`, id).Scan(&result.ID, &result.Title, &startedAt, &duration, &result.AudioPath, &result.PendingPromotion, &result.Interrupted, &result.TranscriptionStatus, &result.TranscriptionFailureCategory, &result.TranscriptionError, &queuedAt, &result.TranscriptionAttempt, &result.Summary.Title, &result.Summary.Overview, &agreements, &actions, &deadlines, &questions, &result.SummaryStatus, &result.SummaryFailureCategory, &result.SummaryError, &summaryQueuedAt, &result.SummaryAttempt)
+	var agreements, suggestions, actions, deadlines, questions string
+	err := s.db.QueryRowContext(ctx, `SELECT id, title, started_at_unix_ns, duration_ns, audio_path, pending_promotion, interrupted, transcription_status, transcription_failure_category, transcription_error, transcription_queued_at_unix_ns, transcription_attempt, summary_title, summary_overview, summary_agreements, summary_suggestions, summary_action_items, summary_deadlines, summary_open_questions, summary_status, summary_failure_category, summary_error, summary_queued_at_unix_ns, summary_attempt FROM recordings WHERE id = ?`, id).Scan(&result.ID, &result.Title, &startedAt, &duration, &result.AudioPath, &result.PendingPromotion, &result.Interrupted, &result.TranscriptionStatus, &result.TranscriptionFailureCategory, &result.TranscriptionError, &queuedAt, &result.TranscriptionAttempt, &result.Summary.Title, &result.Summary.Overview, &agreements, &suggestions, &actions, &deadlines, &questions, &result.SummaryStatus, &result.SummaryFailureCategory, &result.SummaryError, &summaryQueuedAt, &result.SummaryAttempt)
 	if err == sql.ErrNoRows {
 		return Recording{}, fmt.Errorf("load Recording %q: not found", id)
 	}
@@ -715,7 +717,7 @@ func (s *SQLite) Recording(ctx context.Context, id string) (Recording, error) {
 	result.StartedAt = time.Unix(0, startedAt).UTC()
 	result.Duration = time.Duration(duration)
 	result.TranscriptionQueuedAt = time.Unix(0, queuedAt).UTC()
-	if err := decodeSummary(&result, agreements, actions, deadlines, questions, summaryQueuedAt); err != nil {
+	if err := decodeSummary(&result, agreements, suggestions, actions, deadlines, questions, summaryQueuedAt); err != nil {
 		return Recording{}, err
 	}
 	if _, err := os.Stat(result.AudioPath); os.IsNotExist(err) {
@@ -743,11 +745,11 @@ func (s *SQLite) Recording(ctx context.Context, id string) (Recording, error) {
 	return result, nil
 }
 
-func decodeSummary(r *Recording, agreements, actions, deadlines, questions string, queued int64) error {
+func decodeSummary(r *Recording, agreements, suggestions, actions, deadlines, questions string, queued int64) error {
 	for _, pair := range []struct {
 		raw    string
 		target *[]string
-	}{{agreements, &r.Summary.Agreements}, {actions, &r.Summary.ActionItems}, {deadlines, &r.Summary.Deadlines}, {questions, &r.Summary.OpenQuestions}} {
+	}{{agreements, &r.Summary.Agreements}, {suggestions, &r.Summary.Suggestions}, {actions, &r.Summary.ActionItems}, {deadlines, &r.Summary.Deadlines}, {questions, &r.Summary.OpenQuestions}} {
 		if err := json.Unmarshal([]byte(pair.raw), pair.target); err != nil {
 			return fmt.Errorf("read Summary for Recording %q: %w", r.ID, err)
 		}
