@@ -26,6 +26,7 @@ type Whisper struct {
 	Executable string
 	Model      string
 	Threads    int
+	ffmpeg     string
 }
 
 // LoadConfiguredWhisper reads the optional local whisper.cpp configuration.
@@ -55,10 +56,19 @@ func (w Whisper) Transcribe(ctx context.Context, audioPath string) ([]Segment, e
 	}
 	defer os.RemoveAll(outputDir)
 	outputBase := filepath.Join(outputDir, "transcription")
+	wavPath := filepath.Join(outputDir, "recording.wav")
+	ffmpeg := w.ffmpeg
+	if ffmpeg == "" {
+		ffmpeg = "ffmpeg"
+	}
+	conversion := exec.CommandContext(ctx, ffmpeg, "-y", "-v", "error", "-i", audioPath, "-ar", "16000", "-ac", "1", wavPath)
+	if err := conversion.Run(); err != nil {
+		return nil, fmt.Errorf("convert Recording audio for whisper.cpp: %w", err)
+	}
 
 	// whisper.cpp writes JSON to <output-base>.json, not stdout. -l auto preserves
 	// its language detection instead of forcing the user's interface language.
-	command := exec.CommandContext(ctx, w.Executable, "-m", w.Model, "-f", audioPath, "-of", outputBase, "-oj", "-l", "auto", "-t", fmt.Sprint(threads))
+	command := exec.CommandContext(ctx, w.Executable, "-m", w.Model, "-f", wavPath, "-of", outputBase, "-oj", "-l", "auto", "-t", fmt.Sprint(threads))
 	// Discard tool output: it can contain transcription text or local paths, neither
 	// of which belongs in a user-visible error or a warning/error log.
 	if err := command.Run(); err != nil {

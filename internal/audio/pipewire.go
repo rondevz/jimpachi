@@ -331,6 +331,7 @@ func expectedStopError(err error) bool {
 }
 
 func activity(ctx context.Context, command string, arguments ...string) (float64, error) {
+	callerCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
 
@@ -342,12 +343,19 @@ func activity(ctx context.Context, command string, arguments ...string) (float64
 	if err := process.Start(); err != nil {
 		return 0, fmt.Errorf("start %s audio stream: %w", command, err)
 	}
-	defer process.Wait()
 
 	data := make([]byte, 4800)
 	count, err := io.ReadFull(stdout, data)
+	waitErr := process.Wait()
+	if callerCtx.Err() != nil {
+		return 0, fmt.Errorf("read %s audio stream: %w", command, callerCtx.Err())
+	}
+	internalTimeout := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if waitErr != nil && !internalTimeout {
+		return 0, fmt.Errorf("read %s audio stream: %w", command, waitErr)
+	}
 	if err != nil && count < 2 {
-		return 0, fmt.Errorf("read %s audio stream: %w", command, err)
+		return 0, nil
 	}
 
 	var sum float64

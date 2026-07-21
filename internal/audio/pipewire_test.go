@@ -196,3 +196,20 @@ func TestDrainCaptureCopiesAllPCMBeforeReapingInput(t *testing.T) {
 		t.Error("input Wait was not called after draining PCM")
 	}
 }
+
+func TestActivityTreatsCleanEmptyStreamAsSilence(t *testing.T) {
+	level, err := activity(context.Background(), "sh", "-c", "exit 0")
+	if err != nil {
+		t.Fatalf("activity() error = %v, want clean silence", err)
+	}
+	if level != 0 {
+		t.Errorf("activity() = %v, want silence", level)
+	}
+}
+
+func TestActivityReportsFailureAfterPartialAudio(t *testing.T) {
+	_, err := activity(context.Background(), "sh", "-c", "printf '\\001\\000'; exit 1")
+	if err == nil {
+		t.Fatal("activity() error = nil, want process failure")
+	}
+}
