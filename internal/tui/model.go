@@ -88,6 +88,13 @@ type Model struct {
 	settingsSaving  bool
 	confirmDeletion bool
 	width           int
+	height          int
+	detailTab       int
+	detailTabSet    bool
+	detailScroll    int
+	processingPoll  uint64
+	processingEpoch uint64
+	processingLive  bool
 }
 
 // New creates a terminal model backed by Recording history.
@@ -111,10 +118,11 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
-		m.width = message.Width
+		m.width, m.height = message.Width, message.Height
 		return m, nil
 	case initialLoaded:
 		m.recordings = message.recordings
+		m.clampHistoryIndex()
 		m.err = message.historyErr
 		m.reminder = message.startup.Reminder
 		m.recoveryWarning = message.startup.RecoveryWarning
@@ -144,7 +152,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.automaticErr != nil && m.err == nil {
 			m.err = message.automaticErr
 		}
-		return m, tea.Batch(m.activityCommand(), m.processingTick())
+		return m, tea.Batch(m.activityCommand(), m.ensureProcessingPoll())
 	case recordingLimitSaved:
 		if !m.limitSaving || message.limit != m.savingLimit {
 			return m, nil
@@ -214,6 +222,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.active = &message.recording
+		m.processingEpoch++
 		for index, source := range m.sources {
 			if source.ID == message.recording.Source.ID {
 				m.sourceIndex = index
@@ -227,7 +236,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopPending = true
 			return m, m.stopRecording(m.recordingOp)
 		}
-		return m, tea.Batch(m.activityCommand(), tea.Tick(time.Second, func(time.Time) tea.Msg { return recordingTick{} }))
+		return m, tea.Batch(m.activityCommand(), tea.Tick(time.Second, func(time.Time) tea.Msg { return recordingTick{} }), m.ensureProcessingPoll())
 	case recordingStopped:
 		if message.operation != m.recordingOp || !m.stopPending {
 			return m, nil
@@ -243,25 +252,34 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.detail = &message.recording
+		m.initializeDetailTab(message.recording)
 		m.recordings = append([]recording.Recording{message.recording}, m.recordings...)
-		return m, m.transcriptionTick()
+		return m, tea.Batch(m.transcriptionTick(), m.ensureProcessingPoll())
 	case transcriptionLoaded:
 		if m.detail == nil || m.detail.ID != message.recording.ID {
 			return m, nil
 		}
 		if message.err == nil {
 			m.detail = &message.recording
+			m.replaceHistoryRecording(message.recording)
 		}
 		if ((m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning) && !m.transcribing) || ((m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) && !m.summarizing) {
 			return m, m.transcriptionTick()
 		}
 		return m, nil
 	case processingLoaded:
+		if message.generation != m.processingPoll {
+			return m, nil
+		}
+		m.processingLive = false
+		if message.epoch != m.processingEpoch {
+			return m, m.ensureProcessingPoll()
+		}
 		if message.err == nil {
-			m.recordings = message.recordings
+			m.mergeProcessingHistory(message.recordings)
 		}
 		if hasActiveProcessing(m.recordings) {
-			return m, m.processingTick()
+			return m, m.ensureProcessingPoll()
 		}
 		return m, nil
 	case transcriptionRequested:
@@ -273,7 +291,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail = &message.recording
 		m.replaceHistoryRecording(message.recording)
 		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning || message.recording.SummaryStatus == recording.TranscriptionPending || message.recording.SummaryStatus == recording.TranscriptionRunning {
-			return m, m.transcriptionTick()
+			return m, tea.Batch(m.transcriptionTick(), m.ensureProcessingPoll())
 		}
 		return m, nil
 	case summaryRequested:
@@ -284,7 +302,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail = &message.recording
 		m.replaceHistoryRecording(message.recording)
-		return m, m.transcriptionTick()
+		return m, tea.Batch(m.transcriptionTick(), m.ensureProcessingPoll())
 	case transcriptionCancelled:
 		m.cancelling = false
 		if message.err != nil {
@@ -303,6 +321,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.detail = &message.recording
+		m.initializeDetailTab(message.recording)
 		if message.recording.TranscriptionStatus == recording.TranscriptionPending || message.recording.TranscriptionStatus == recording.TranscriptionRunning || message.recording.SummaryStatus == recording.TranscriptionPending || message.recording.SummaryStatus == recording.TranscriptionRunning {
 			return m, m.transcriptionTick()
 		}
@@ -321,6 +340,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.settings = message.settings
 		m.err = nil
 		m.showSettings = true
+		m.detailScroll = 0
 		return m, nil
 	case settingsSaved:
 		m.settingsSaving = false
@@ -347,6 +367,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.clampHistoryIndex()
 		return m, nil
 	case recordingAudioOpened:
 		if message.err != nil {
@@ -360,8 +381,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopPending = false
 			m.warning = ""
 			m.detail = state.Completed
+			m.initializeDetailTab(*state.Completed)
 			m.recordings = append([]recording.Recording{*state.Completed}, m.recordings...)
-			return m, m.transcriptionTick()
+			return m, tea.Batch(m.transcriptionTick(), m.ensureProcessingPoll())
 		}
 		m.warning = state.Warning
 		if state.Failure != "" {
@@ -403,7 +425,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		key := message.String()
-		if key == "q" || key == "ctrl+c" {
+		if key == "ctrl+c" {
 			return m, tea.Quit
 		}
 		if m.editingTitle {
@@ -433,6 +455,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case "n", "esc":
 				m.confirmDeletion = false
+			case "q":
+				return m, tea.Quit
 			}
 			return m, nil
 		}
@@ -476,6 +500,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if key == "q" {
+			return m, tea.Quit
+		}
 		if m.showSettings {
 			switch key {
 			case "esc", "g":
@@ -504,6 +531,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				if !m.settingsSaving {
 					m.settingsSaving = true
 					return m, m.saveSettings(m.settings)
+				}
+			case "up", "k":
+				if m.detailScroll > 0 {
+					m.detailScroll--
+				}
+			case "down", "j":
+				if m.detailScroll < m.maxContentScroll() {
+					m.detailScroll++
 				}
 			}
 			return m, nil
@@ -564,14 +599,25 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.loadSettings()
 		case "esc":
 			m.detail = nil
+			m.detailTab = 0
+			m.detailTabSet = false
+			m.detailScroll = 0
 			m.historyFocused = true
 		case "tab":
-			if m.detail == nil && len(m.recordings) > 0 {
+			if m.detail != nil {
+				m.detailTab = (m.effectiveDetailTab() + 1) % 3
+				m.detailTabSet = true
+				m.detailScroll = 0
+			} else if len(m.recordings) > 0 {
 				m.historyFocused = !m.historyFocused
 			}
 		case "up", "k":
-			if m.historyFocused && m.historyIndex > 0 {
-				m.historyIndex--
+			if m.detail != nil && m.detailScroll > 0 {
+				m.detailScroll--
+			} else if m.historyFocused {
+				if m.historyIndex > 0 {
+					m.historyIndex--
+				}
 			} else if m.active == nil && m.sourceIndex > 0 {
 				m.sourceIndex--
 				m.generation++
@@ -579,8 +625,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.activityCommand()
 			}
 		case "down", "j":
-			if m.historyFocused && m.historyIndex+1 < len(m.recordings) {
-				m.historyIndex++
+			if m.detail != nil {
+				if m.detailScroll < m.maxContentScroll() {
+					m.detailScroll++
+				}
+			} else if m.historyFocused {
+				if m.historyIndex+1 < len(m.recordings) {
+					m.historyIndex++
+				}
 			} else if m.active == nil && m.sourceIndex+1 < len(m.sources) {
 				m.sourceIndex++
 				m.generation++
@@ -588,7 +640,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.activityCommand()
 			}
 		case "enter":
-			if m.historyFocused && len(m.recordings) > 0 {
+			if m.historyFocused && m.historyIndex >= 0 && m.historyIndex < len(m.recordings) {
 				return m, m.openRecording(m.recordings[m.historyIndex].ID)
 			} else if m.active == nil && len(m.sources) > 0 {
 				m.confirmation++
@@ -625,218 +677,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-// View renders Recording history.
-func (m Model) View() string {
-	var view strings.Builder
-	view.WriteString("Jimpachi\n\n")
-	if m.reminder != "" {
-		fmt.Fprintf(&view, "%s\n\n", m.reminder)
-	}
-	if m.recoveryWarning != "" {
-		fmt.Fprintf(&view, "%s\n\n", m.recoveryWarning)
-	}
-	view.WriteString("Audio source\n\n")
-	if m.discoveryError != "" {
-		fmt.Fprintf(&view, "%s\n", m.discoveryError)
-	}
-	if m.enteringPath {
-		fmt.Fprintf(&view, "Monitor source path: %s_\n\n", m.path)
-	} else if len(m.sources) == 0 {
-		view.WriteString("No system-output monitors found.\n\n")
-	} else {
-		for index, source := range m.sources {
-			prefix := "  "
-			if index == m.sourceIndex {
-				prefix = "> "
-			}
-			if index == m.sourceIndex {
-				fmt.Fprintf(&view, "%s%s%s\n", prefix, terminalText(source.Name), sourceActivityView(source, m.activity))
-			} else {
-				fmt.Fprintf(&view, "%s%s\n", prefix, terminalText(source.Name))
-			}
-		}
-		view.WriteString("\nUse up/down and enter to select.\n\n")
-	}
-	if m.activityErr != nil {
-		fmt.Fprintf(&view, "Unable to measure Audio activity: %v\n\n", m.activityErr)
-	}
-	if m.active != nil {
-		fmt.Fprintf(&view, "RECORDING  %s  %s%s\n", time.Since(m.active.StartedAt).Round(time.Second), terminalText(m.active.Source.Name), sourceActivityView(m.active.Source, m.activity))
-		if m.warning != "" {
-			fmt.Fprintf(&view, "%s\n", m.warning)
-		}
-		view.WriteString("Press s to stop capture.\n\n")
-	} else {
-		view.WriteString("Press r to start capture from the selected source.\n\n")
-	}
-	if m.recordingLimit == 0 {
-		view.WriteString("Recording limit: disabled. Press l to enable.\n\n")
-	} else {
-		fmt.Fprintf(&view, "Recording limit: %s. Press [ or ] to adjust; l disables.\n\n", m.recordingLimit)
-	}
-	if m.automatic {
-		view.WriteString("Automatic transcription: enabled. Press p to disable.\n\n")
-	} else {
-		view.WriteString("Automatic transcription: disabled. Press p to enable.\n\n")
-	}
-	if m.detail != nil {
-		view.WriteString("Recording detail\n\n")
-		if m.editingTitle {
-			fmt.Fprintf(&view, "Title: %s_\n", terminalText(m.title))
-			view.WriteString("Enter saves title; esc cancels.\n")
-		} else {
-			fmt.Fprintf(&view, "%s\n", terminalText(m.detail.Title))
-			fmt.Fprintf(&view, "ID: %s\nStarted: %s\nDuration: %s\nAudio: %s\n", terminalText(m.detail.ID), m.detail.StartedAt.Local().Format("2006-01-02 15:04:05"), m.detail.Duration.Round(time.Second), terminalText(m.detail.AudioPath))
-			if m.detail.AudioMissing {
-				view.WriteString("Audio file is missing.\n")
-			}
-			if m.detail.Interrupted {
-				view.WriteString("Interrupted capture recovered after restart.\n")
-			}
-			if m.confirmDeletion {
-				view.WriteString("\nDelete this Recording and all local artifacts? Press y to confirm or n to cancel.\n")
-				return view.String()
-			}
-			view.WriteString("\nTranscription\n\n")
-			switch m.detail.TranscriptionStatus {
-			case recording.TranscriptionPending:
-				view.WriteString("Post-processing: queued.\n")
-			case recording.TranscriptionRunning:
-				view.WriteString("Post-processing: transcribing.\n")
-			case recording.TranscriptionFailed:
-				fmt.Fprintf(&view, "Transcription failed: %s\nPost-processing: failed (%s).\n", terminalText(m.detail.TranscriptionError), terminalText(string(m.detail.TranscriptionFailureCategory)))
-			case recording.TranscriptionCancelled:
-				fmt.Fprintf(&view, "Post-processing: cancelled. %s\n", terminalText(m.detail.TranscriptionError))
-			case recording.TranscriptionSucceeded:
-				if len(m.detail.Transcription) == 0 {
-					view.WriteString("No speech was detected.\n")
-				}
-			default:
-				view.WriteString("No Transcription yet.\n")
-			}
-			if len(m.detail.Transcription) > 0 {
-				for _, segment := range m.detail.Transcription {
-					fmt.Fprintf(&view, "[%s - %s] %s\n", formatTimestamp(segment.Start), formatTimestamp(segment.End), terminalText(segment.Text))
-				}
-			}
-			view.WriteString("\nSummary\n\n")
-			fmt.Fprintf(&view, "%s\n", wrapText("Auxiliary interpretation; verify against the Transcription and Recording audio.", m.contentWidth()))
-			switch m.detail.SummaryStatus {
-			case recording.TranscriptionPending:
-				view.WriteString("Post-processing: summary queued.\n")
-			case recording.TranscriptionRunning:
-				if m.detail.SummaryProgress > 0 {
-					fmt.Fprintf(&view, "Post-processing: summarizing (%d characters generated).\n", m.detail.SummaryProgress)
-				} else {
-					view.WriteString("Post-processing: summarizing.\n")
-				}
-			case recording.TranscriptionFailed:
-				fmt.Fprintf(&view, "Summary failed: %s\n", terminalText(m.detail.SummaryError))
-			case recording.TranscriptionSucceeded:
-				if m.detail.Summary.Overview != "" {
-					fmt.Fprintf(&view, "%s\n", wrapText(terminalText(m.detail.Summary.Overview), m.contentWidth()))
-				}
-				for _, section := range []struct {
-					name   string
-					values []string
-				}{{"Agreements and decisions", m.detail.Summary.Agreements}, {"Suggestions", m.detail.Summary.Suggestions}, {"Action items", m.detail.Summary.ActionItems}, {"Deadlines", m.detail.Summary.Deadlines}, {"Open questions", m.detail.Summary.OpenQuestions}} {
-					if len(section.values) > 0 {
-						fmt.Fprintf(&view, "%s\n", wrapText(section.name+": "+terminalText(strings.Join(section.values, "; ")), m.contentWidth()))
-					}
-				}
-			default:
-				view.WriteString("No Summary yet.\n")
-			}
-			if m.detail.TranscriptionStatus == recording.TranscriptionFailed || m.detail.TranscriptionStatus == recording.TranscriptionCancelled {
-				view.WriteString("\nPress t to retry transcription; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			} else if m.detail.TranscriptionStatus == recording.TranscriptionPending || m.detail.TranscriptionStatus == recording.TranscriptionRunning {
-				view.WriteString("\nPress c to cancel; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionPending || m.detail.SummaryStatus == recording.TranscriptionRunning) {
-				view.WriteString("\nPress c to cancel Summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded && (m.detail.SummaryStatus == recording.TranscriptionFailed || m.detail.SummaryStatus == recording.TranscriptionCancelled) {
-				view.WriteString("\nPress m to retry Summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			} else if m.detail.TranscriptionStatus == recording.TranscriptionSucceeded {
-				view.WriteString("\nPress t to transcribe; m to generate summary; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			} else {
-				view.WriteString("\nPress t to transcribe; o to open audio; d to delete; e to edit title; esc returns to history.\n")
-			}
-		}
-		return view.String()
-	}
-	if m.showSettings {
-		view.WriteString("Settings\n\n")
-		fmt.Fprintf(&view, "Audio source: %s\n", terminalText(m.settings.AudioSource.Name))
-		fmt.Fprintf(&view, "Automatic transcription: %t (a toggles)\n", m.settings.AutomaticTranscription)
-		fmt.Fprintf(&view, "Recording limit: %s ([, ], l adjust)\n", m.settings.RecordingLimit)
-		fmt.Fprintf(&view, "Whisper executable (w): %s\n", terminalText(m.settings.Processing.WhisperExecutable))
-		fmt.Fprintf(&view, "Whisper model (m): %s\n", terminalText(m.settings.Processing.WhisperModel))
-		fmt.Fprintf(&view, "CPU threads (t): %d\n", m.settings.Processing.WhisperThreads)
-		fmt.Fprintf(&view, "Ollama endpoint (o): %s\n", terminalText(m.settings.Processing.OllamaEndpoint))
-		fmt.Fprintf(&view, "Ollama model (n): %s\n", terminalText(m.settings.Processing.OllamaModel))
-		if m.settings.ValidationError != "" {
-			fmt.Fprintf(&view, "\nConfiguration needs attention: %s\n", terminalText(m.settings.ValidationError))
-		}
-		if m.err != nil {
-			fmt.Fprintf(&view, "\nUnable to save Settings: %v\n", terminalText(m.err.Error()))
-		}
-		if m.settingsEditing != "" {
-			fmt.Fprintf(&view, "\n%s_\n", terminalText(m.settingsInput))
-		}
-		view.WriteString("\nPress s to save; esc returns. Select Audio source from the main view.\n")
-		return view.String()
-	}
-	view.WriteString("Recording history\n\n")
-
-	if m.err != nil {
-		fmt.Fprintf(&view, "Jimpachi error: %v\n", m.err)
-		return view.String()
-	}
-	if len(m.recordings) == 0 {
-		view.WriteString("No recordings yet.\n")
-		return view.String()
-	}
-
-	for index, entry := range m.recordings {
-		prefix := "  "
-		if m.historyFocused && index == m.historyIndex {
-			prefix = "> "
-		}
-		fmt.Fprintf(&view, "%s%s\n", prefix, terminalText(entry.Title))
-		fmt.Fprintf(&view, "%s  %s\n\n", entry.StartedAt.Local().Format("2006-01-02 15:04"), entry.Duration.Round(1e9))
-		switch entry.TranscriptionStatus {
-		case recording.TranscriptionPending:
-			view.WriteString("Post-processing: queued\n\n")
-		case recording.TranscriptionRunning:
-			view.WriteString("Post-processing: transcribing\n\n")
-		case recording.TranscriptionFailed:
-			fmt.Fprintf(&view, "Post-processing: failed (%s)\n\n", terminalText(string(entry.TranscriptionFailureCategory)))
-		case recording.TranscriptionCancelled:
-			view.WriteString("Post-processing: cancelled\n\n")
-		}
-		switch entry.SummaryStatus {
-		case recording.TranscriptionPending:
-			view.WriteString("Post-processing: summary queued\n\n")
-		case recording.TranscriptionRunning:
-			if entry.SummaryProgress > 0 {
-				fmt.Fprintf(&view, "Post-processing: summarizing (%d characters generated)\n\n", entry.SummaryProgress)
-			} else {
-				view.WriteString("Post-processing: summarizing\n\n")
-			}
-		case recording.TranscriptionFailed:
-			fmt.Fprintf(&view, "Post-processing: summary failed (%s)\n\n", terminalText(string(entry.SummaryFailureCategory)))
-		}
-		if entry.AudioMissing {
-			view.WriteString("Audio file is missing.\n\n")
-		}
-		if entry.Interrupted {
-			view.WriteString("Interrupted capture recovered after restart.\n\n")
-		}
-	}
-	view.WriteString("Press tab to focus history; up/down and enter open a Recording.\n")
-
-	return view.String()
 }
 
 type initialLoaded struct {
@@ -906,6 +746,8 @@ type transcriptionCancelled struct {
 }
 type processingLoaded struct {
 	recordings []recording.Recording
+	generation uint64
+	epoch      uint64
 	err        error
 }
 type automaticTranscriptionSaved struct {
@@ -991,11 +833,56 @@ func (m Model) transcriptionTick() tea.Cmd {
 	})
 }
 
-func (m Model) processingTick() tea.Cmd {
+func (m *Model) ensureProcessingPoll() tea.Cmd {
+	if m.processingLive {
+		return nil
+	}
+	m.processingLive = true
+	m.processingPoll++
+	return m.processingTick(m.processingPoll, m.processingEpoch)
+}
+
+func (m Model) processingTick(generation, epoch uint64) tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg {
 		recordings, err := m.workflow.History(m.ctx)
-		return processingLoaded{recordings: recordings, err: err}
+		return processingLoaded{recordings: recordings, generation: generation, epoch: epoch, err: err}
 	})
+}
+
+func (m *Model) clampHistoryIndex() {
+	if len(m.recordings) == 0 {
+		m.historyIndex = 0
+		return
+	}
+	m.historyIndex = minView(maxView(0, m.historyIndex), len(m.recordings)-1)
+}
+
+func (m *Model) mergeProcessingHistory(fresh []recording.Recording) {
+	byID := make(map[string]recording.Recording, len(fresh))
+	for _, entry := range fresh {
+		byID[entry.ID] = entry
+	}
+	for index := range m.recordings {
+		entry, ok := byID[m.recordings[index].ID]
+		if !ok {
+			continue
+		}
+		current := &m.recordings[index]
+		current.Transcription = entry.Transcription
+		current.TranscriptionStatus = entry.TranscriptionStatus
+		current.TranscriptionFailureCategory = entry.TranscriptionFailureCategory
+		current.TranscriptionError = entry.TranscriptionError
+		current.TranscriptionQueuedAt = entry.TranscriptionQueuedAt
+		current.TranscriptionAttempt = entry.TranscriptionAttempt
+		current.Summary = entry.Summary
+		current.SummaryStatus = entry.SummaryStatus
+		current.SummaryFailureCategory = entry.SummaryFailureCategory
+		current.SummaryError = entry.SummaryError
+		current.SummaryQueuedAt = entry.SummaryQueuedAt
+		current.SummaryAttempt = entry.SummaryAttempt
+		current.SummaryProgress = entry.SummaryProgress
+	}
+	m.clampHistoryIndex()
 }
 
 func hasActiveProcessing(recordings []recording.Recording) bool {
@@ -1044,10 +931,24 @@ func (m Model) cancelSummary(id string) tea.Cmd {
 func (m *Model) replaceHistoryRecording(updated recording.Recording) {
 	for index := range m.recordings {
 		if m.recordings[index].ID == updated.ID {
+			if processingVersionChanged(m.recordings[index], updated) {
+				m.processingEpoch++
+			}
 			m.recordings[index] = updated
 			return
 		}
 	}
+	m.processingEpoch++
+}
+
+func processingVersionChanged(current, updated recording.Recording) bool {
+	return current.TranscriptionStatus != updated.TranscriptionStatus ||
+		current.TranscriptionAttempt != updated.TranscriptionAttempt ||
+		!current.TranscriptionQueuedAt.Equal(updated.TranscriptionQueuedAt) ||
+		current.SummaryStatus != updated.SummaryStatus ||
+		current.SummaryAttempt != updated.SummaryAttempt ||
+		!current.SummaryQueuedAt.Equal(updated.SummaryQueuedAt) ||
+		current.SummaryProgress != updated.SummaryProgress
 }
 
 func (m Model) openRecording(id string) tea.Cmd {
@@ -1201,13 +1102,6 @@ func terminalText(text string) string {
 
 func formatTimestamp(value time.Duration) string {
 	return fmt.Sprintf("%02d:%02d:%02d", int(value.Hours()), int(value.Minutes())%60, int(value.Seconds())%60)
-}
-
-func (m Model) contentWidth() int {
-	if m.width > 0 {
-		return m.width
-	}
-	return 80
 }
 
 func wrapText(text string, width int) string {

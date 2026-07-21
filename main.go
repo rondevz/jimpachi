@@ -32,7 +32,7 @@ func run() error {
 		return err
 	}
 
-	p := tea.NewProgram(tui.New(ctx, workflow))
+	p := tea.NewProgram(tui.New(ctx, workflow), tea.WithAltScreen())
 	_, runErr := p.Run()
 	closeErr := workflow.Close()
 	cancel()

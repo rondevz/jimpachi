@@ -3,14 +3,17 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"jimpachi/internal/app"
 	"jimpachi/internal/audio"
+	"jimpachi/internal/config"
 	"jimpachi/internal/recording"
 )
 
@@ -18,8 +21,8 @@ func TestModelShowsEmptyRecordingHistory(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 
 	view := model.View()
-	if !strings.Contains(view, "Recording history") {
-		t.Errorf("View() = %q, want Recording history", view)
+	if !strings.Contains(view, "LIBRARY") {
+		t.Errorf("View() = %q, want Recording library", view)
 	}
 	if !strings.Contains(view, "No recordings yet.") {
 		t.Errorf("View() = %q, want empty history message", view)
@@ -33,7 +36,7 @@ func TestModelEditsAndSavesSettings(t *testing.T) {
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
 	updated, _ = updated.Update(command())
 	model = updated.(Model)
-	if view := model.View(); !strings.Contains(view, "Settings") || !strings.Contains(view, "Audio source: Speakers") {
+	if view := model.View(); !strings.Contains(view, "SETTINGS") || !strings.Contains(view, "Speakers") {
 		t.Errorf("View() = %q, want Settings with selected Audio source", view)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
@@ -51,7 +54,7 @@ func TestModelShowsSettingsValidationFeedback(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{settings: app.Settings{ValidationError: "whisper model path: no such file"}}))
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
 	updated, _ = updated.Update(command())
-	if view := updated.View(); !strings.Contains(view, "Configuration needs attention: whisper model path: no such file") {
+	if view := normalizedView(updated.View()); !strings.Contains(view, "CONFIGURATION NEEDS ATTENTION whisper model path: no such file") {
 		t.Errorf("View() = %q, want Settings validation feedback", view)
 	}
 }
@@ -68,7 +71,7 @@ func TestModelDoesNotPollPulseMonitorActivity(t *testing.T) {
 	if command := model.activityCommand(); command != nil {
 		t.Fatal("activityCommand() enabled Pulse monitor polling")
 	}
-	if view := model.View(); strings.Contains(view, "activity meter") || !strings.Contains(view, "> Output monitor\n") {
+	if view := normalizedView(model.View()); strings.Contains(view, "activity meter") || !strings.Contains(view, "> Output monitor") {
 		t.Errorf("View() = %q, want Pulse monitor without meter label", view)
 	}
 }
@@ -120,7 +123,7 @@ func TestModelOpensPersistedRecordingDetailFromHistory(t *testing.T) {
 		t.Fatal("opening selected Recording did not request detail")
 	}
 	updated, _ = updated.Update(command())
-	if view := updated.View(); !strings.Contains(view, "Recording detail") || !strings.Contains(view, "Deploy now.") {
+	if view := updated.View(); !strings.Contains(view, "RECORDING DETAIL") || !strings.Contains(view, "Deploy now.") {
 		t.Errorf("View() = %q, want persisted Recording detail and Transcription", view)
 	}
 }
@@ -145,11 +148,59 @@ func TestModelShowsFullTimestampedTranscriptionInRecordingDetail(t *testing.T) {
 		{Start: time.Second, End: 3 * time.Second, Text: "Deploy the service."},
 		{Start: 4 * time.Second, End: 6 * time.Second, Text: "Verify the dashboard."},
 	}}
-	view := model.View()
-	for _, want := range []string{"Transcription", "[00:00:01 - 00:00:03] Deploy the service.", "[00:00:04 - 00:00:06] Verify the dashboard."} {
+	view := normalizedView(model.View())
+	for _, want := range []string{"TRANSCRIPTION", "[00:00:01 - 00:00:03] Deploy the service.", "[00:00:04 - 00:00:06] Verify the dashboard."} {
 		if !strings.Contains(view, want) {
 			t.Errorf("View() = %q, want %q", view, want)
 		}
+	}
+}
+
+func TestTranscriptLinesFitTheirViewportWithoutDroppingText(t *testing.T) {
+	const text = "This is a deliberately long transcript segment whose final verification token must remain visible after wrapping."
+	model := Model{detail: &recording.Recording{TranscriptionStatus: recording.TranscriptionSucceeded, Transcription: []recording.Segment{{Start: time.Second, End: 2 * time.Second, Text: text}}}}
+	page := model.transcriptPage(48)
+	if !strings.Contains(normalizedView(page), "verification token must remain visible") {
+		t.Errorf("transcriptPage() = %q, dropped transcript text", page)
+	}
+	for _, line := range strings.Split(page, "\n") {
+		if width := lipgloss.Width(line); width > 48 {
+			t.Errorf("transcript line width = %d, want <= 48: %q", width, line)
+		}
+	}
+}
+
+func TestTranscriptTextRemainsReachableBelowTimestampWidth(t *testing.T) {
+	const text = "Every transcript token remains reachable."
+	model := Model{detail: &recording.Recording{TranscriptionStatus: recording.TranscriptionSucceeded, Transcription: []recording.Segment{{Start: time.Second, End: 2 * time.Second, Text: text}}}}
+	page := fitTerminal(model.transcriptPage(16), 16, 50)
+	if !strings.Contains(normalizedView(page), text) {
+		t.Errorf("transcriptPage() = %q, dropped transcript text", page)
+	}
+	for _, line := range strings.Split(page, "\n") {
+		if width := lipgloss.Width(line); width > 16 {
+			t.Errorf("transcript line width = %d, want <= 16: %q", width, line)
+		}
+	}
+}
+
+func TestModelCyclesDetailTabsAndScrollsContent(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionSucceeded}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = updated.(Model)
+	if model.detailTab != 2 || !strings.Contains(model.View(), "authoritative artifact") {
+		t.Errorf("tab = %d; View() = %q", model.detailTab, model.View())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.detailScroll != 0 {
+		t.Errorf("detail scroll = %d, want bounded 0", model.detailScroll)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = updated.(Model)
+	if model.detailTab != 0 || model.detailScroll != 0 || !strings.Contains(model.View(), "No Summary yet") {
+		t.Errorf("tab = %d, scroll = %d; View() = %q", model.detailTab, model.detailScroll, model.View())
 	}
 }
 
@@ -157,14 +208,14 @@ func TestModelShowsStructuredSummaryAndRetryControl(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionSucceeded, SummaryStatus: recording.TranscriptionFailed, SummaryError: "Summary could not be completed. Try again."}
 	view := model.View()
-	if !strings.Contains(view, "Summary failed: Summary could not be completed. Try again.") || !strings.Contains(view, "m to retry Summary") {
+	if normalized := normalizedView(view); !strings.Contains(normalized, "SUMMARY FAILED Summary could not be completed. Try again.") || !strings.Contains(normalized, "m Retry Summary") {
 		t.Errorf("View() = %q", view)
 	}
 	model.detail.SummaryStatus = recording.TranscriptionSucceeded
 	model.detail.Summary = recording.Summary{Overview: "The conversation concerned a Friday release.", Suggestions: []string{"Use staging"}, ActionItems: []string{"Test release"}, OpenQuestions: []string{"Who approves?"}}
 	view = model.View()
-	for _, want := range []string{"Auxiliary interpretation", "The conversation concerned a Friday release.", "Suggestions: Use staging", "Action items: Test release", "Open questions: Who approves?"} {
-		if !strings.Contains(view, want) {
+	for _, want := range []string{"auxiliary interpretation", "The conversation concerned a Friday release.", "SUGGESTIONS Use staging", "ACTION ITEMS Test release", "OPEN QUESTIONS Who approves?"} {
+		if !strings.Contains(normalizedView(view), want) {
 			t.Errorf("View() = %q, want %q", view, want)
 		}
 	}
@@ -175,7 +226,7 @@ func TestModelWrapsSummaryToTerminalWidth(t *testing.T) {
 	model.detail = &recording.Recording{SummaryStatus: recording.TranscriptionSucceeded, Summary: recording.Summary{Overview: "This conversation was about preparing and safely deploying the Friday release."}}
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 32})
 	view := updated.View()
-	if !strings.Contains(view, "This conversation was about\npreparing and safely deploying\nthe Friday release.") {
+	if !strings.Contains(normalizedView(view), "This conversation was about preparing and safely deploying the Friday release.") {
 		t.Errorf("View() = %q, want wrapped Summary overview", view)
 	}
 }
@@ -194,6 +245,192 @@ func TestWrapTextHonorsNarrowAndWideTerminalCells(t *testing.T) {
 		if got := wrapText(test.text, test.width); got != test.want {
 			t.Errorf("wrapText(%q, %d) = %q, want %q", test.text, test.width, got, test.want)
 		}
+	}
+}
+
+func TestFieldNotesViewStaysInsideTerminalDimensions(t *testing.T) {
+	recordings := make([]recording.Recording, 20)
+	for index := range recordings {
+		recordings[index] = recording.Recording{ID: fmt.Sprint(index), Title: "A Recording with a reasonably long title", StartedAt: time.Now(), Duration: time.Minute}
+	}
+	base := load(t, New(context.Background(), fakeHistory{sources: []audio.Source{{ID: "output.monitor", Name: "System output monitor"}}, recordings: recordings}))
+	for _, size := range []tea.WindowSizeMsg{{Width: 20, Height: 10}, {Width: 75, Height: 16}, {Width: 107, Height: 20}, {Width: 123, Height: 24}, {Width: 124, Height: 24}, {Width: 140, Height: 28}} {
+		updated, _ := base.Update(size)
+		view := updated.View()
+		lines := strings.Split(view, "\n")
+		if len(lines) > size.Height {
+			t.Errorf("View(%dx%d) height = %d", size.Width, size.Height, len(lines))
+		}
+		for _, line := range lines {
+			if width := lipgloss.Width(line); width > size.Width {
+				t.Errorf("View(%dx%d) line width = %d: %q", size.Width, size.Height, width, line)
+			}
+		}
+	}
+}
+
+func TestSettingsScrollOnShortTerminal(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{settings: app.Settings{Processing: config.Processing{OllamaEndpoint: "http://127.0.0.1:11434"}}}))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	updated, _ = updated.Update(command())
+	updated, _ = updated.Update(tea.WindowSizeMsg{Width: 72, Height: 12})
+	if strings.Contains(updated.View(), "127.0.0.1") {
+		t.Fatal("short Settings view unexpectedly showed lower fields before scrolling")
+	}
+	for range 10 {
+		updated, _ = updated.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if !strings.Contains(updated.View(), "127.0.0.1") {
+		t.Errorf("View() = %q, want scrolled Ollama endpoint", updated.View())
+	}
+}
+
+func TestSettingsEditorsStayVisibleOnShortTerminal(t *testing.T) {
+	for _, key := range []string{"w", "m", "t", "o", "n"} {
+		model := Model{showSettings: true, width: 72, height: 10, settings: app.Settings{Processing: config.Processing{WhisperExecutable: "/usr/bin/whisper", WhisperModel: "/models/model.bin", WhisperThreads: 3, OllamaEndpoint: "http://127.0.0.1:11434", OllamaModel: "llama3.2:1b"}}}
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		view := updated.View()
+		if !strings.Contains(view, "EDIT SETTING") || !strings.Contains(view, "_") {
+			t.Errorf("editor %q View() = %q", key, view)
+		}
+	}
+}
+
+func TestNarrowDetailShowsOperationErrors(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{}))
+	model.detail = &recording.Recording{ID: "recording-1"}
+	model.err = errors.New("open Recording audio: player unavailable")
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 72, Height: 24})
+	if !strings.Contains(normalizedView(updated.View()), "JIMPACHI ERROR open Recording audio: player unavailable") {
+		t.Errorf("View() = %q, want operation error", updated.View())
+	}
+}
+
+func TestEditorsAcceptLowercaseQ(t *testing.T) {
+	model := Model{editingTitle: true, title: "Release"}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if command != nil || updated.(Model).title != "Releaseq" {
+		t.Errorf("title editor = %#v, command %v", updated, command)
+	}
+	model = Model{enteringPath: true, path: "/monitor/"}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if command != nil || updated.(Model).path != "/monitor/q" {
+		t.Errorf("path editor = %#v, command %v", updated, command)
+	}
+	model = Model{settingsEditing: "n", settingsInput: "model-"}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if command != nil || updated.(Model).settingsInput != "model-q" {
+		t.Errorf("Settings editor = %#v, command %v", updated, command)
+	}
+}
+
+func TestHistoryNavigationDoesNotLeakIntoSourcePicker(t *testing.T) {
+	model := Model{historyFocused: true, historyIndex: 0, sourceIndex: 0, recordings: []recording.Recording{{ID: "recording-1"}}, sources: []audio.Source{{ID: "one"}, {ID: "two"}}}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if command != nil || updated.(Model).sourceIndex != 0 {
+		t.Errorf("source index = %d, command %v", updated.(Model).sourceIndex, command)
+	}
+}
+
+func TestFocusedRecordingRemainsVisibleOnShortTerminal(t *testing.T) {
+	recordings := make([]recording.Recording, 8)
+	for index := range recordings {
+		recordings[index] = recording.Recording{ID: fmt.Sprint(index), Title: fmt.Sprintf("Recording %d", index+1)}
+	}
+	model := Model{width: 72, height: 12, historyFocused: true, historyIndex: 6, recordings: recordings, sources: []audio.Source{{ID: "source"}}}
+	if view := normalizedView(model.View()); !strings.Contains(view, "● Recording 7") {
+		t.Errorf("View() = %q, want focused Recording", model.View())
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if view := normalizedView(updated.View()); !strings.Contains(view, "● Recording 8") {
+		t.Errorf("View() after down = %q, want focused Recording", updated.View())
+	}
+}
+
+func TestFocusedSourceRemainsVisibleInLongList(t *testing.T) {
+	sources := make([]audio.Source, 10)
+	for index := range sources {
+		sources[index] = audio.Source{ID: fmt.Sprint(index), Name: fmt.Sprintf("Source %d", index+1)}
+	}
+	model := Model{width: 140, height: 20, sourceIndex: 8, sources: sources}
+	if view := normalizedView(model.View()); !strings.Contains(view, "> Source 9") {
+		t.Errorf("View() = %q, want focused Audio source", model.View())
+	}
+}
+
+func TestFocusedRecordingRemainsVisibleInWideVariableHeightLibrary(t *testing.T) {
+	recordings := make([]recording.Recording, 8)
+	for index := range recordings {
+		recordings[index] = recording.Recording{ID: fmt.Sprint(index), Title: fmt.Sprintf("Recording %d", index+1), Interrupted: index%2 == 0, AudioMissing: index%3 == 0}
+	}
+	model := Model{width: 140, height: 16, historyFocused: true, historyIndex: 6, recordings: recordings}
+	if view := normalizedView(model.View()); !strings.Contains(view, "● Recording 7") {
+		t.Errorf("View() = %q, want focused Recording", model.View())
+	}
+}
+
+func TestDeletingSelectedLastRecordingClampsHistorySelection(t *testing.T) {
+	recordings := []recording.Recording{{ID: "one"}, {ID: "two"}, {ID: "three"}}
+	model := Model{workflow: fakeHistory{recordings: recordings}, recordings: recordings, historyFocused: true, historyIndex: 2}
+	updated, _ := model.Update(recordingDeleted{id: "three"})
+	model = updated.(Model)
+	if model.historyIndex != 1 {
+		t.Fatalf("history index = %d, want 1", model.historyIndex)
+	}
+	_, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if command == nil {
+		t.Fatal("opening the clamped history selection did not issue a command")
+	}
+}
+
+func TestDeletionConfirmationAllowsAdvertisedQuitCommand(t *testing.T) {
+	model := Model{confirmDeletion: true, detail: &recording.Recording{ID: "one"}}
+	_, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if command == nil {
+		t.Fatal("q during deletion confirmation did not quit")
+	}
+}
+
+func TestWideErrorsStayAboveLongSourceList(t *testing.T) {
+	sources := make([]audio.Source, 20)
+	for index := range sources {
+		sources[index] = audio.Source{ID: fmt.Sprint(index), Name: fmt.Sprintf("Source %d", index)}
+	}
+	model := Model{width: 120, height: 18, sources: sources, err: errors.New("player unavailable")}
+	if view := normalizedView(model.View()); !strings.Contains(view, "JIMPACHI ERROR") || !strings.Contains(view, "player unavailable") {
+		t.Errorf("View() = %q, want visible error", model.View())
+	}
+}
+
+func TestDetailScrollStopsAtContentBoundary(t *testing.T) {
+	segments := make([]recording.Segment, 20)
+	for index := range segments {
+		segments[index] = recording.Segment{Start: time.Duration(index) * time.Second, End: time.Duration(index+1) * time.Second, Text: "Transcript segment"}
+	}
+	model := Model{width: 72, height: 12, detail: &recording.Recording{TranscriptionStatus: recording.TranscriptionSucceeded, Transcription: segments}, detailTab: 1, detailTabSet: true}
+	for range 100 {
+		updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+		model = updated.(Model)
+	}
+	maximum := model.maxContentScroll()
+	if model.detailScroll != maximum {
+		t.Fatalf("detail scroll = %d, want max %d", model.detailScroll, maximum)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if updated.(Model).detailScroll != maximum-1 {
+		t.Errorf("detail scroll after up = %d, want %d", updated.(Model).detailScroll, maximum-1)
+	}
+}
+
+func TestFieldNotesSanitizesActiveAndSettingsValues(t *testing.T) {
+	unsafe := "\x1b]8;;https://example.invalid\aUnsafe\x1b]8;;\a"
+	model := Model{active: &app.ActiveRecording{Source: audio.Source{Name: unsafe}, StartedAt: time.Now()}, selected: audio.Source{Name: unsafe}}
+	if view := model.View(); strings.ContainsAny(view, "\x1b\a") || strings.Contains(view, "example.invalid") {
+		t.Errorf("active View() = %q, rendered terminal controls", view)
+	}
+	model = Model{showSettings: true, settings: app.Settings{AudioSource: audio.Source{Name: unsafe}, Processing: config.Processing{WhisperExecutable: unsafe, WhisperModel: unsafe, OllamaEndpoint: unsafe, OllamaModel: unsafe}}, settingsEditing: "n", settingsInput: unsafe}
+	if view := model.View(); strings.ContainsAny(view, "\x1b\a") || strings.Contains(view, "example.invalid") {
+		t.Errorf("Settings View() = %q, rendered terminal controls", view)
 	}
 }
 
@@ -224,7 +461,7 @@ func TestModelCancelsQueuedSummary(t *testing.T) {
 func TestModelShowsFailedTranscriptionAndStopsPolling(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{}))
 	model.detail = &recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionFailed, TranscriptionError: "Transcription could not be completed."}
-	if view := model.View(); !strings.Contains(view, "Transcription failed: Transcription could not be completed.") || !strings.Contains(view, "Press t to retry") {
+	if view := normalizedView(model.View()); !strings.Contains(view, "TRANSCRIPTION FAILED Transcription could not be completed. Press t to retry.") {
 		t.Errorf("View() = %q, want Transcription failure and retry guidance", view)
 	}
 	updated, command := model.Update(transcriptionLoaded{recording: *model.detail})
@@ -269,6 +506,68 @@ func TestModelUpdatesHistoryStatusAfterManualRequestAndCancellation(t *testing.T
 	}
 }
 
+func TestModelClearsLibraryProcessingStateWhenDetailCompletes(t *testing.T) {
+	pending := recording.Recording{ID: "recording-1", Title: "Instructions", TranscriptionStatus: recording.TranscriptionSucceeded, SummaryStatus: recording.TranscriptionRunning}
+	model := Model{workflow: fakeHistory{}, recordings: []recording.Recording{pending}, detail: &pending}
+	completed := pending
+	completed.SummaryStatus = recording.TranscriptionSucceeded
+	updated, command := model.Update(transcriptionLoaded{recording: completed})
+	model = updated.(Model)
+	if model.recordings[0].SummaryStatus != recording.TranscriptionSucceeded {
+		t.Errorf("library Summary status = %q, want succeeded", model.recordings[0].SummaryStatus)
+	}
+	if command != nil {
+		t.Fatal("completed processing scheduled another detail poll")
+	}
+	if strings.Contains(model.View(), "Post-processing: queued") || strings.Contains(model.View(), "Summarizing") {
+		t.Errorf("View() = %q, retained processing marker", model.View())
+	}
+}
+
+func TestModelMaintainsSingleProcessingPollAndIgnoresStaleSnapshots(t *testing.T) {
+	pending := recording.Recording{ID: "recording-1", Title: "Current title", TranscriptionStatus: recording.TranscriptionPending}
+	model := Model{workflow: fakeHistory{}, recordings: []recording.Recording{pending}}
+	if command := model.ensureProcessingPoll(); command == nil {
+		t.Fatal("first processing poll was not scheduled")
+	}
+	if command := model.ensureProcessingPoll(); command != nil {
+		t.Fatal("second concurrent processing poll was scheduled")
+	}
+	updated, command := model.Update(processingLoaded{generation: model.processingPoll - 1, recordings: []recording.Recording{{ID: pending.ID, Title: "Stale title", TranscriptionStatus: recording.TranscriptionSucceeded}}})
+	model = updated.(Model)
+	if model.recordings[0].TranscriptionStatus != recording.TranscriptionPending || !model.processingLive || command != nil {
+		t.Fatalf("stale processing snapshot changed model: %#v, command %v", model, command)
+	}
+	updated, command = model.Update(processingLoaded{generation: model.processingPoll, recordings: []recording.Recording{{ID: pending.ID, Title: "Stale title", TranscriptionStatus: recording.TranscriptionSucceeded}}})
+	model = updated.(Model)
+	if model.recordings[0].Title != "Current title" || model.recordings[0].TranscriptionStatus != recording.TranscriptionSucceeded || model.processingLive || command != nil {
+		t.Fatalf("current processing snapshot merged incorrectly: %#v, command %v", model, command)
+	}
+}
+
+func TestModelInvalidatesSnapshotFromBeforeLocalProcessingChange(t *testing.T) {
+	current := recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionPending, TranscriptionAttempt: 2}
+	model := Model{workflow: fakeHistory{}, recordings: []recording.Recording{current}, processingPoll: 1, processingEpoch: 2, processingLive: true}
+	updated, command := model.Update(processingLoaded{generation: 1, epoch: 1, recordings: []recording.Recording{{ID: current.ID, TranscriptionStatus: recording.TranscriptionSucceeded, TranscriptionAttempt: 1}}})
+	model = updated.(Model)
+	if got := model.recordings[0]; got.TranscriptionAttempt != 2 || got.TranscriptionStatus != recording.TranscriptionPending {
+		t.Errorf("merged Recording = %#v, want newer local processing attempt", got)
+	}
+	if command == nil || !model.processingLive {
+		t.Fatal("invalidated snapshot did not schedule a fresh processing poll")
+	}
+}
+
+func TestModelAcceptsProcessingPauseAndProgressResetFromCurrentSnapshot(t *testing.T) {
+	current := recording.Recording{ID: "recording-1", TranscriptionStatus: recording.TranscriptionRunning, SummaryStatus: recording.TranscriptionRunning, SummaryProgress: 120}
+	model := Model{recordings: []recording.Recording{current}, processingPoll: 1, processingEpoch: 2, processingLive: true}
+	updated, _ := model.Update(processingLoaded{generation: 1, epoch: 2, recordings: []recording.Recording{{ID: current.ID, TranscriptionStatus: recording.TranscriptionPending, SummaryStatus: recording.TranscriptionPending, SummaryProgress: 0}}})
+	got := updated.(Model).recordings[0]
+	if got.TranscriptionStatus != recording.TranscriptionPending || got.SummaryStatus != recording.TranscriptionPending || got.SummaryProgress != 0 {
+		t.Errorf("merged Recording = %#v, want paused processing with reset progress", got)
+	}
+}
+
 func TestModelUsesQueuedStatusReturnedAfterAutomaticStopInHistory(t *testing.T) {
 	completed := recording.Recording{ID: "recording-1", Title: "Instructions", TranscriptionStatus: recording.TranscriptionPending}
 	model := Model{workflow: fakeHistory{}, stopPending: true, recordingOp: 1}
@@ -288,22 +587,31 @@ func TestModelShowsMissingAudioCondition(t *testing.T) {
 
 func TestModelShowsInterruptedRecording(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{Title: "Interrupted", Interrupted: true}}}))
-	if !strings.Contains(model.View(), "Interrupted capture") {
+	if !strings.Contains(model.View(), "Interrupted capture recovered") {
 		t.Errorf("View() = %q, want interrupted capture marker", model.View())
+	}
+}
+
+func TestModelDistinguishesPendingRecoveryFromRecoveredAudio(t *testing.T) {
+	entry := recording.Recording{Title: "Interrupted", Interrupted: true, PendingPromotion: true, AudioMissing: true}
+	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{entry}}))
+	view := normalizedView(model.View())
+	if !strings.Contains(view, "Interrupted capture retained; recovery will retry") || strings.Contains(view, "Audio file is missing") || strings.Contains(view, "capture recovered") {
+		t.Errorf("View() = %q, want pending recovery without recovered or missing labels", model.View())
 	}
 }
 
 func TestModelShowsRecoveryAndAutomaticStopFailures(t *testing.T) {
 	active := &app.ActiveRecording{ID: "recording-1"}
 	model := load(t, New(context.Background(), fakeHistory{startup: app.Startup{RecoveryWarning: "Could not verify interrupted Recording"}}))
-	if !strings.Contains(model.View(), "Could not verify interrupted Recording") {
+	if !strings.Contains(normalizedView(model.View()), "Could not verify interrupted Recording") {
 		t.Errorf("View() = %q, want recovery warning", model.View())
 	}
 	model.active = active
 	model.workflow = fakeHistory{captureState: app.CaptureState{Failure: "context deadline exceeded"}}
 	updated, _ := model.Update(recordingTick{})
 	model = updated.(Model)
-	if model.active != nil || !strings.Contains(model.View(), "Recording failed: context deadline exceeded") {
+	if model.active != nil || !strings.Contains(normalizedView(model.View()), "Recording failed: context deadline exceeded") {
 		t.Errorf("View() = %q, want automatic stop failure", updated.View())
 	}
 }
@@ -318,7 +626,7 @@ func TestModelLetsUserDisableRecordingLimit(t *testing.T) {
 	}
 	updated, _ = updated.Update(command())
 	model = updated.(Model)
-	if savedLimit != 0 || !strings.Contains(model.View(), "Recording limit: disabled") {
+	if savedLimit != 0 || !strings.Contains(normalizedView(model.View()), "LIMIT Disabled") {
 		t.Errorf("limit toggle saved %v; View() = %q", savedLimit, model.View())
 	}
 }
@@ -434,7 +742,7 @@ func TestModelHistoryLoadCanBeCancelled(t *testing.T) {
 	select {
 	case message := <-result:
 		updated, _ := model.Update(message)
-		if !strings.Contains(updated.View(), "context canceled") {
+		if !strings.Contains(normalizedView(updated.View()), "context canceled") {
 			t.Errorf("View() = %q, want cancellation error", updated.View())
 		}
 	case <-time.After(time.Second):
@@ -584,7 +892,7 @@ func TestModelShowsCaptureDurationAndCompletedRecordingDetail(t *testing.T) {
 	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
 	updated, _ = updated.Update(command())
 	model = updated.(Model)
-	for _, want := range []string{"Recording detail", completed.ID, completed.AudioPath, "Duration: 5s"} {
+	for _, want := range []string{"RECORDING DETAIL", completed.ID, completed.AudioPath, "DURATION 5s"} {
 		if !strings.Contains(model.View(), want) {
 			t.Errorf("View() = %q, want %q", model.View(), want)
 		}
@@ -767,6 +1075,10 @@ func load(t *testing.T, model Model) Model {
 	message := model.Init()()
 	updated, _ := model.Update(message)
 	return updated.(Model)
+}
+
+func normalizedView(view string) string {
+	return strings.Join(strings.Fields(view), " ")
 }
 
 type fakeHistory struct {
