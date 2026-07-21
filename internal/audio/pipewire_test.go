@@ -116,6 +116,18 @@ func TestValidateSystemOutputSourceAcceptsPulseAudioMonitorFallback(t *testing.T
 	}
 }
 
+func TestPulseSourcesMarksMonitorForPulseCapture(t *testing.T) {
+	sources, err := pulseSources(context.Background(), func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("1355\tbluez_output.80_0A_E5_B4_42_00.1.monitor\tPipeWire\n"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || !sources[0].Pulse {
+		t.Errorf("pulseSources() = %#v, want Pulse monitor", sources)
+	}
+}
+
 func TestPlayableBoundsFFprobeWithTimeout(t *testing.T) {
 	adapter := pipeWire{
 		lookPath: func(string) error { return nil },

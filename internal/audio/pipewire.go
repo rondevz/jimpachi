@@ -132,7 +132,7 @@ func pulseSources(ctx context.Context, run outputRunner) ([]Source, error) {
 		if len(fields) < 2 || !strings.HasSuffix(fields[1], ".monitor") {
 			continue
 		}
-		sources = append(sources, Source{ID: fields[1], Name: fields[1]})
+		sources = append(sources, Source{ID: fields[1], Name: fields[1], Pulse: true})
 	}
 
 	return sources, nil
@@ -142,7 +142,7 @@ func (p pipeWire) Activity(ctx context.Context, source Source) (float64, error) 
 	if err := p.validateSystemOutputSource(ctx, source); err != nil {
 		return 0, err
 	}
-	if p.lookPath("pw-cat") == nil {
+	if !source.Pulse && p.lookPath("pw-cat") == nil {
 		level, pipeWireErr := activity(ctx, "pw-cat", "--record", "--target", source.ID, "--format", "s16", "--rate", "48000", "--channels", "1", "-")
 		if pipeWireErr == nil {
 			return level, nil
@@ -169,7 +169,7 @@ func (p pipeWire) Start(ctx context.Context, source Source, path string) (Captur
 
 	command := "pw-cat"
 	arguments := []string{"--record", "--target", source.ID, "--format", "s16", "--rate", "48000", "--channels", "1", "-"}
-	if p.lookPath(command) != nil {
+	if source.Pulse || p.lookPath(command) != nil {
 		if err := p.lookPath("parec"); err != nil {
 			return nil, fmt.Errorf("start Audio capture: pw-cat and parec are unavailable: %w", err)
 		}

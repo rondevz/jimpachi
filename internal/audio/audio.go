@@ -8,6 +8,7 @@ type Source struct {
 	ID       string
 	Name     string
 	Explicit bool
+	Pulse    bool
 }
 
 // Adapter interacts with the operating system's audio server.

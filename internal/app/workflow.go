@@ -351,6 +351,7 @@ func (w *Workflow) AudioSources(ctx context.Context) (AudioState, error) {
 		for _, source := range state.Sources {
 			if source.ID == selectedID {
 				found = true
+				state.Selected = source
 				break
 			}
 		}
