@@ -3,6 +3,7 @@ jimpachi
 *.exe
 *.test
 *.out
+dist/
 
 # Local application data
 .data/

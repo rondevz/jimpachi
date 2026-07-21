@@ -1,0 +1,66 @@
+version: 2
+
+project_name: jimpachi
+
+builds:
+  - id: jimpachi
+    main: .
+    binary: jimpachi
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: archive
+    ids:
+      - jimpachi
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - id: deb
+    ids:
+      - jimpachi
+    package_name: jimpachi
+    vendor: Jimpachi contributors
+    homepage: https://github.com/rondevz/jimpachi
+    maintainer: Jimpachi contributors
+    description: Local-first terminal notebook for system audio
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/bin
+    dependencies:
+      - libc6 (>= 2.35)
+      - pipewire-bin
+      - pulseaudio-utils
+      - ffmpeg
+      - xdg-utils
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  draft: true
+  prerelease: auto

@@ -53,7 +53,21 @@ Select a source ending in `.monitor`, such as `bluez_output.<device>.monitor` or
 
 ## Install
 
-Jimpachi does not yet publish release binaries. Build it from source:
+### Debian Package
+
+Tagged releases publish an `amd64` Debian package for Ubuntu 22.04 or newer on the [GitHub Releases](https://github.com/rondevz/jimpachi/releases) page. Download the package, then install it with APT so its runtime dependencies are installed too:
+
+```sh
+sudo apt install ./jimpachi_<version>_linux_amd64.deb
+```
+
+Install a newer release with the same command and the path to its downloaded package. Jimpachi preserves configuration and Recordings across package upgrades.
+
+Release pages also provide a `.tar.gz` archive and SHA-256 checksums for manual installation. GitHub records build provenance for each package, archive, and checksum file; verify a downloaded artifact with `gh attestation verify <file> --repo rondevz/jimpachi`.
+
+### Build From Source
+
+To build Jimpachi from source:
 
 ```sh
 git clone https://github.com/rondevz/jimpachi.git
@@ -75,6 +89,8 @@ go run .
 ```
 
 Jimpachi uses the terminal's alternate screen and restores the previous shell contents when it exits.
+
+Releases use semantic tags such as `v0.1.0`. The release workflow must pass formatting, module, test, vet, build, race-detector, and snapshot-package checks before it can publish a tag.
 
 ## Configure Local Processing
 
