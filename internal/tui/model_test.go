@@ -26,6 +26,36 @@ func TestModelShowsEmptyRecordingHistory(t *testing.T) {
 	}
 }
 
+func TestModelEditsAndSavesSettings(t *testing.T) {
+	saved := app.Settings{}
+	workflow := fakeHistory{settings: app.Settings{AudioSource: audio.Source{Name: "Speakers"}, RecordingLimit: time.Hour, AutomaticTranscription: true}, savedSettings: &saved}
+	model := load(t, New(context.Background(), workflow))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	updated, _ = updated.Update(command())
+	model = updated.(Model)
+	if view := model.View(); !strings.Contains(view, "Settings") || !strings.Contains(view, "Audio source: Speakers") {
+		t.Errorf("View() = %q, want Settings with selected Audio source", view)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	updated, command = updated.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if command == nil {
+		t.Fatal("saving Settings did not issue a workflow command")
+	}
+	updated, _ = updated.Update(command())
+	if saved.AutomaticTranscription {
+		t.Errorf("saved Settings = %#v, want automatic Transcription disabled", saved)
+	}
+}
+
+func TestModelShowsSettingsValidationFeedback(t *testing.T) {
+	model := load(t, New(context.Background(), fakeHistory{settings: app.Settings{ValidationError: "whisper model path: no such file"}}))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	updated, _ = updated.Update(command())
+	if view := updated.View(); !strings.Contains(view, "Configuration needs attention: whisper model path: no such file") {
+		t.Errorf("View() = %q, want Settings validation feedback", view)
+	}
+}
+
 func TestModelShowsRecordingHistory(t *testing.T) {
 	model := load(t, New(context.Background(), fakeHistory{recordings: []recording.Recording{{
 		ID:        "recording-1",
@@ -675,22 +705,24 @@ func load(t *testing.T, model Model) Model {
 }
 
 type fakeHistory struct {
-	recordings   []recording.Recording
-	err          error
-	sources      []audio.Source
-	audioErr     error
-	activity     float64
-	metered      *[]audio.Source
-	started      app.ActiveRecording
-	stopped      recording.Recording
-	captureState app.CaptureState
-	startup      app.Startup
-	limit        time.Duration
-	savedLimit   *time.Duration
-	limitWrites  *[]time.Duration
-	limitErr     error
-	requested    *recording.Recording
-	cancelled    *string
+	recordings    []recording.Recording
+	err           error
+	sources       []audio.Source
+	audioErr      error
+	activity      float64
+	metered       *[]audio.Source
+	started       app.ActiveRecording
+	stopped       recording.Recording
+	captureState  app.CaptureState
+	startup       app.Startup
+	limit         time.Duration
+	savedLimit    *time.Duration
+	limitWrites   *[]time.Duration
+	limitErr      error
+	requested     *recording.Recording
+	cancelled     *string
+	settings      app.Settings
+	savedSettings *app.Settings
 }
 
 func (f fakeHistory) Startup(context.Context) (app.Startup, error) { return f.startup, nil }
@@ -765,6 +797,15 @@ func (f fakeHistory) CancelTranscription(_ context.Context, id string) error {
 
 func (f fakeHistory) CancelSummary(context.Context, string) error { return nil }
 
+func (f fakeHistory) Settings(context.Context) (app.Settings, error) { return f.settings, nil }
+
+func (f fakeHistory) SaveSettings(_ context.Context, settings app.Settings) error {
+	if f.savedSettings != nil {
+		*f.savedSettings = settings
+	}
+	return nil
+}
+
 func sameDurations(got, want []time.Duration) bool {
 	if len(got) != len(want) {
 		return false
@@ -838,3 +879,7 @@ func (f blockingHistory) RequestSummary(context.Context, string) (recording.Reco
 func (f blockingHistory) CancelTranscription(context.Context, string) error { return nil }
 
 func (f blockingHistory) CancelSummary(context.Context, string) error { return nil }
+
+func (f blockingHistory) Settings(context.Context) (app.Settings, error) { return app.Settings{}, nil }
+
+func (f blockingHistory) SaveSettings(context.Context, app.Settings) error { return nil }

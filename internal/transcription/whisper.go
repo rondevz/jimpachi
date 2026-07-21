@@ -8,9 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
+
+	"jimpachi/internal/config"
 )
 
 // Segment is one timestamped span of a Transcription.
@@ -29,52 +30,11 @@ type Whisper struct {
 
 // LoadConfiguredWhisper reads the optional local whisper.cpp configuration.
 func LoadConfiguredWhisper() (Whisper, error) {
-	configHome := os.Getenv("XDG_CONFIG_HOME")
-	if configHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return Whisper{}, fmt.Errorf("locate user home for whisper.cpp configuration: %w", err)
-		}
-		configHome = filepath.Join(home, ".config")
-	}
-	contents, err := os.ReadFile(filepath.Join(configHome, "jimpachi", "config.toml"))
-	if os.IsNotExist(err) {
-		return Whisper{}, nil
-	}
+	configured, err := config.Load(context.Background())
 	if err != nil {
 		return Whisper{}, fmt.Errorf("read whisper.cpp configuration: %w", err)
 	}
-	var configured Whisper
-	inWhisper := false
-	for _, line := range strings.Split(string(contents), "\n") {
-		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
-		if line == "[whisper]" {
-			inWhisper = true
-			continue
-		}
-		if strings.HasPrefix(line, "[") {
-			inWhisper = false
-			continue
-		}
-		if !inWhisper || !strings.Contains(line, "=") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		key, value := strings.TrimSpace(parts[0]), strings.Trim(strings.TrimSpace(parts[1]), "\"")
-		switch key {
-		case "executable":
-			configured.Executable = value
-		case "model":
-			configured.Model = value
-		case "threads":
-			threads, err := strconv.Atoi(value)
-			if err != nil || threads < 1 {
-				return Whisper{}, fmt.Errorf("read whisper.cpp configuration: threads must be a positive integer")
-			}
-			configured.Threads = threads
-		}
-	}
-	return configured, nil
+	return Whisper{Executable: configured.WhisperExecutable, Model: configured.WhisperModel, Threads: configured.WhisperThreads}, nil
 }
 
 // Transcribe produces timestamped text with whisper.cpp language auto-detection.

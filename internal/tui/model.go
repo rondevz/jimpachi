@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,8 @@ type Workflow interface {
 	RequestSummary(context.Context, string) (recording.Recording, error)
 	CancelTranscription(context.Context, string) error
 	CancelSummary(context.Context, string) error
+	Settings(context.Context) (app.Settings, error)
+	SaveSettings(context.Context, app.Settings) error
 }
 
 // Model renders Jimpachi's Recording history.
@@ -73,6 +76,11 @@ type Model struct {
 	automatic       bool
 	historyFocused  bool
 	historyIndex    int
+	settings        app.Settings
+	showSettings    bool
+	settingsEditing string
+	settingsInput   string
+	settingsSaving  bool
 }
 
 // New creates a terminal model backed by Recording history.
@@ -295,6 +303,27 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = message.err
 		}
 		return m, nil
+	case settingsLoaded:
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.settings = message.settings
+		m.err = nil
+		m.showSettings = true
+		return m, nil
+	case settingsSaved:
+		m.settingsSaving = false
+		if message.err != nil {
+			m.err = message.err
+			return m, nil
+		}
+		m.showSettings = false
+		m.err = nil
+		m.recordingLimit = message.settings.RecordingLimit
+		m.persistedLimit = message.settings.RecordingLimit
+		m.automatic = message.settings.AutomaticTranscription
+		return m, nil
 	case recordingTick:
 		state := m.workflow.CaptureState()
 		if state.Completed != nil {
@@ -389,6 +418,56 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.settingsEditing != "" {
+			switch key {
+			case "esc":
+				m.settingsEditing, m.settingsInput = "", ""
+			case "enter":
+				m.applySettingsInput()
+				m.settingsEditing, m.settingsInput = "", ""
+			case "backspace":
+				if len(m.settingsInput) > 0 {
+					m.settingsInput = m.settingsInput[:len(m.settingsInput)-1]
+				}
+			default:
+				if len(key) == 1 {
+					m.settingsInput += key
+				}
+			}
+			return m, nil
+		}
+		if m.showSettings {
+			switch key {
+			case "esc", "g":
+				m.showSettings = false
+			case "a":
+				m.settings.AutomaticTranscription = !m.settings.AutomaticTranscription
+			case "l":
+				if m.settings.RecordingLimit == 0 {
+					m.settings.RecordingLimit = time.Hour
+				} else {
+					m.settings.RecordingLimit = 0
+				}
+			case "[":
+				if m.settings.RecordingLimit > 5*time.Minute {
+					m.settings.RecordingLimit -= 5 * time.Minute
+				}
+			case "]":
+				if m.settings.RecordingLimit == 0 {
+					m.settings.RecordingLimit = time.Hour
+				} else {
+					m.settings.RecordingLimit += 5 * time.Minute
+				}
+			case "w", "m", "t", "o", "n":
+				m.startSettingsEdit(key)
+			case "s":
+				if !m.settingsSaving {
+					m.settingsSaving = true
+					return m, m.saveSettings(m.settings)
+				}
+			}
+			return m, nil
+		}
 		switch key {
 		case "r":
 			if m.active == nil && !m.startPending && !m.stopPending {
@@ -433,6 +512,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.automatic = !m.automatic
 				return m, m.setAutomaticTranscription(m.automatic)
 			}
+		case "g":
+			return m, m.loadSettings()
 		case "esc":
 			m.detail = nil
 			m.historyFocused = true
@@ -627,6 +708,28 @@ func (m Model) View() string {
 		}
 		return view.String()
 	}
+	if m.showSettings {
+		view.WriteString("Settings\n\n")
+		fmt.Fprintf(&view, "Audio source: %s\n", terminalText(m.settings.AudioSource.Name))
+		fmt.Fprintf(&view, "Automatic transcription: %t (a toggles)\n", m.settings.AutomaticTranscription)
+		fmt.Fprintf(&view, "Recording limit: %s ([, ], l adjust)\n", m.settings.RecordingLimit)
+		fmt.Fprintf(&view, "Whisper executable (w): %s\n", terminalText(m.settings.Processing.WhisperExecutable))
+		fmt.Fprintf(&view, "Whisper model (m): %s\n", terminalText(m.settings.Processing.WhisperModel))
+		fmt.Fprintf(&view, "CPU threads (t): %d\n", m.settings.Processing.WhisperThreads)
+		fmt.Fprintf(&view, "Ollama endpoint (o): %s\n", terminalText(m.settings.Processing.OllamaEndpoint))
+		fmt.Fprintf(&view, "Ollama model (n): %s\n", terminalText(m.settings.Processing.OllamaModel))
+		if m.settings.ValidationError != "" {
+			fmt.Fprintf(&view, "\nConfiguration needs attention: %s\n", terminalText(m.settings.ValidationError))
+		}
+		if m.err != nil {
+			fmt.Fprintf(&view, "\nUnable to save Settings: %v\n", terminalText(m.err.Error()))
+		}
+		if m.settingsEditing != "" {
+			fmt.Fprintf(&view, "\n%s_\n", terminalText(m.settingsInput))
+		}
+		view.WriteString("\nPress s to save; esc returns. Select Audio source from the main view.\n")
+		return view.String()
+	}
 	view.WriteString("Recording history\n\n")
 
 	if m.err != nil {
@@ -752,6 +855,14 @@ type recordingOpened struct {
 	recording recording.Recording
 	err       error
 }
+type settingsLoaded struct {
+	settings app.Settings
+	err      error
+}
+type settingsSaved struct {
+	settings app.Settings
+	err      error
+}
 
 func (m Model) activityCommand() tea.Cmd {
 	if len(m.sources) == 0 {
@@ -873,6 +984,55 @@ func (m Model) openRecording(id string) tea.Cmd {
 func (m Model) setAutomaticTranscription(enabled bool) tea.Cmd {
 	return func() tea.Msg {
 		return automaticTranscriptionSaved{enabled: enabled, err: m.workflow.SetAutomaticTranscription(m.ctx, enabled)}
+	}
+}
+
+func (m Model) loadSettings() tea.Cmd {
+	return func() tea.Msg {
+		settings, err := m.workflow.Settings(m.ctx)
+		return settingsLoaded{settings: settings, err: err}
+	}
+}
+
+func (m Model) saveSettings(settings app.Settings) tea.Cmd {
+	return func() tea.Msg {
+		return settingsSaved{settings: settings, err: m.workflow.SaveSettings(m.ctx, settings)}
+	}
+}
+
+func (m *Model) startSettingsEdit(field string) {
+	m.settingsEditing = field
+	switch field {
+	case "w":
+		m.settingsInput = m.settings.Processing.WhisperExecutable
+	case "m":
+		m.settingsInput = m.settings.Processing.WhisperModel
+	case "t":
+		m.settingsInput = fmt.Sprint(m.settings.Processing.WhisperThreads)
+	case "o":
+		m.settingsInput = m.settings.Processing.OllamaEndpoint
+	case "n":
+		m.settingsInput = m.settings.Processing.OllamaModel
+	}
+}
+
+func (m *Model) applySettingsInput() {
+	switch m.settingsEditing {
+	case "w":
+		m.settings.Processing.WhisperExecutable = m.settingsInput
+	case "m":
+		m.settings.Processing.WhisperModel = m.settingsInput
+	case "t":
+		threads, err := strconv.Atoi(m.settingsInput)
+		if err != nil {
+			m.err = fmt.Errorf("CPU threads must be a positive integer")
+			return
+		}
+		m.settings.Processing.WhisperThreads = threads
+	case "o":
+		m.settings.Processing.OllamaEndpoint = m.settingsInput
+	case "n":
+		m.settings.Processing.OllamaModel = m.settingsInput
 	}
 }
 

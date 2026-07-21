@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"jimpachi/internal/audio"
+	"jimpachi/internal/config"
 	"jimpachi/internal/recording"
 	"jimpachi/internal/summary"
 	"jimpachi/internal/transcription"
@@ -202,6 +203,97 @@ func (w *Workflow) Startup(ctx context.Context) (Startup, error) {
 type Startup struct {
 	Reminder        string
 	RecoveryWarning string
+}
+
+// Settings is the user-controlled configuration for future Recording and post-processing.
+type Settings struct {
+	AudioSource            audio.Source
+	AutomaticTranscription bool
+	RecordingLimit         time.Duration
+	Processing             config.Processing
+	ValidationError        string
+}
+
+// Settings returns the saved configuration used for subsequent work.
+func (w *Workflow) Settings(ctx context.Context) (Settings, error) {
+	limit, err := w.RecordingLimit(ctx)
+	if err != nil {
+		return Settings{}, err
+	}
+	automatic, err := w.AutomaticTranscription(ctx)
+	if err != nil {
+		return Settings{}, err
+	}
+	processing, err := config.Load(ctx)
+	if err != nil {
+		return Settings{}, err
+	}
+	id, found, err := w.history.Setting(ctx, "audio_source_id")
+	if err != nil {
+		return Settings{}, fmt.Errorf("load Settings Audio source: %w", err)
+	}
+	settings := Settings{AutomaticTranscription: automatic, RecordingLimit: limit, Processing: processing}
+	validation := []string{}
+	if err := config.Validate(processing); err != nil {
+		validation = append(validation, err.Error())
+	}
+	if found {
+		name, _, err := w.history.Setting(ctx, "audio_source_name")
+		if err != nil {
+			return Settings{}, fmt.Errorf("load Settings Audio source name: %w", err)
+		}
+		explicit, _, err := w.history.Setting(ctx, "audio_source_explicit")
+		if err != nil {
+			return Settings{}, fmt.Errorf("load Settings Audio source type: %w", err)
+		}
+		settings.AudioSource = audio.Source{ID: id, Name: name, Explicit: explicit == "true"}
+		if _, err := w.audio.Activity(ctx, settings.AudioSource); err != nil {
+			validation = append(validation, fmt.Sprintf("validate Audio source: %v", err))
+		}
+	}
+	settings.ValidationError = strings.Join(validation, "; ")
+	return settings, nil
+}
+
+// SaveSettings validates and persists configuration, then applies it to future processing.
+func (w *Workflow) SaveSettings(ctx context.Context, settings Settings) error {
+	if settings.RecordingLimit < 0 || settings.RecordingLimit%time.Minute != 0 {
+		return fmt.Errorf("save Settings: Recording limit must use whole minutes or zero")
+	}
+	previousConfig, previousConfigExists, err := config.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("save Settings: snapshot previous processing configuration: %w", err)
+	}
+	if err := config.Save(ctx, settings.Processing); err != nil {
+		return fmt.Errorf("save Settings: %w", err)
+	}
+	values := map[string]string{
+		"automatic_transcription": strconv.FormatBool(settings.AutomaticTranscription),
+		"recording_limit_minutes": strconv.FormatInt(int64(settings.RecordingLimit/time.Minute), 10),
+	}
+	if settings.AudioSource.ID != "" {
+		name := settings.AudioSource.Name
+		if name == "" {
+			name = settings.AudioSource.ID
+		}
+		values["audio_source_id"] = settings.AudioSource.ID
+		values["audio_source_name"] = name
+		values["audio_source_explicit"] = strconv.FormatBool(settings.AudioSource.Explicit)
+	}
+	if err := w.history.SaveSettings(ctx, values); err != nil {
+		if restoreErr := config.Restore(context.Background(), previousConfig, previousConfigExists); restoreErr != nil {
+			return fmt.Errorf("save Settings: %w; restore prior processing configuration: %v", err, restoreErr)
+		}
+		return fmt.Errorf("save Settings: %w", err)
+	}
+	w.processingMu.Lock()
+	w.transcriber = transcription.Whisper{Executable: settings.Processing.WhisperExecutable, Model: settings.Processing.WhisperModel, Threads: settings.Processing.WhisperThreads}
+	w.summarizer = summary.Ollama{Endpoint: settings.Processing.OllamaEndpoint, Model: settings.Processing.OllamaModel}
+	w.processingMu.Unlock()
+	if settings.AutomaticTranscription {
+		w.wakeTranscriptionWorker()
+	}
+	return nil
 }
 
 // AudioState contains source choices and any discovery guidance for the UI.
@@ -651,7 +743,10 @@ func (w *Workflow) enqueueTranscription(ctx context.Context, completed recording
 }
 
 func (w *Workflow) transcribe(ctx context.Context, completed recording.Recording) ([]recording.Segment, error) {
-	segments, err := w.transcriber.Transcribe(ctx, completed.AudioPath)
+	w.processingMu.Lock()
+	transcriber := w.transcriber
+	w.processingMu.Unlock()
+	segments, err := transcriber.Transcribe(ctx, completed.AudioPath)
 	if err != nil {
 		return nil, fmt.Errorf("transcribe Recording %q: %w", completed.ID, err)
 	}
@@ -759,7 +854,10 @@ func (w *Workflow) runSummary(ctx context.Context) bool {
 	done := make(chan struct{})
 	w.runningCancel, w.runningDone, w.runningID, w.runningAttempt, w.runningCancelledByUser = cancel, done, completed.ID, completed.SummaryAttempt, false
 	w.processingMu.Unlock()
-	result, runErr := w.summarizer.Summarize(runCtx, strings.Join(parts, "\n"))
+	w.processingMu.Lock()
+	summarizer := w.summarizer
+	w.processingMu.Unlock()
+	result, runErr := summarizer.Summarize(runCtx, strings.Join(parts, "\n"))
 	w.processingMu.Lock()
 	cancelledByUser := w.runningCancelledByUser
 	w.processingMu.Unlock()

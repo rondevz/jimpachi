@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"jimpachi/internal/audio"
+	"jimpachi/internal/config"
 	"jimpachi/internal/recording"
 	"jimpachi/internal/summary"
 	"jimpachi/internal/transcription"
@@ -37,6 +38,67 @@ func TestOpenCreatesWorkflowWithEmptyRecordingHistory(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(dir, "jimpachi.db")); err != nil {
 		t.Errorf("Recording history database was not created: %v", err)
+	}
+}
+
+func TestWorkflowSavesSettingsForFutureRecordingAndProcessing(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	executable := filepath.Join(t.TempDir(), "whisper-cli")
+	model := filepath.Join(t.TempDir(), "model.bin")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model, []byte("model"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := OpenWithAudioAndProcessors(ctx, t.TempDir(), fakeAudio{}, &fakeTranscriber{}, &fakeSummarizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	want := Settings{
+		AudioSource:            audio.Source{ID: "speakers.monitor", Name: "Speakers"},
+		AutomaticTranscription: false,
+		RecordingLimit:         25 * time.Minute,
+		Processing:             config.Processing{WhisperExecutable: executable, WhisperModel: model, WhisperThreads: 2, OllamaEndpoint: "http://127.0.0.1:11434", OllamaModel: "llama3.2"},
+	}
+	if err := workflow.SaveSettings(ctx, want); err != nil {
+		t.Fatalf("SaveSettings() error = %v", err)
+	}
+	got, err := workflow.Settings(ctx)
+	if err != nil {
+		t.Fatalf("Settings() error = %v", err)
+	}
+	if got != want {
+		t.Errorf("Settings() = %#v, want %#v", got, want)
+	}
+}
+
+func TestWorkflowReportsStaleLocalProcessingPathsInSettings(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := config.Save(ctx, config.Processing{WhisperExecutable: "/missing/whisper", WhisperModel: "/missing/model.bin", WhisperThreads: 3}); err == nil {
+		t.Fatal("Save() unexpectedly accepted missing local paths")
+	}
+	configPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "jimpachi")
+	if err := os.MkdirAll(configPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configPath, "config.toml"), []byte("[whisper]\nexecutable = \"/missing/whisper\"\nmodel = \"/missing/model.bin\"\nthreads = 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := OpenWithAudioAndProcessors(ctx, t.TempDir(), fakeAudio{}, &fakeTranscriber{}, &fakeSummarizer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workflow.Close() })
+	settings, err := workflow.Settings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.ValidationError == "" {
+		t.Fatal("Settings() did not report stale whisper paths")
 	}
 }
 

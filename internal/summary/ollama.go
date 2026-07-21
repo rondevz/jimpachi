@@ -11,10 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"jimpachi/internal/config"
 )
 
 // ErrConfiguration identifies invalid or incomplete local Ollama setup.
@@ -39,45 +39,11 @@ type Ollama struct {
 
 // LoadConfiguredOllama reads optional [ollama] endpoint and model configuration.
 func LoadConfiguredOllama() (Ollama, error) {
-	home := os.Getenv("XDG_CONFIG_HOME")
-	if home == "" {
-		var err error
-		home, err = os.UserHomeDir()
-		if err != nil {
-			return Ollama{}, fmt.Errorf("locate user home for Ollama configuration: %w", err)
-		}
-		home = filepath.Join(home, ".config")
-	}
-	b, err := os.ReadFile(filepath.Join(home, "jimpachi", "config.toml"))
-	if os.IsNotExist(err) {
-		return Ollama{}, nil
-	}
+	configured, err := config.Load(context.Background())
 	if err != nil {
 		return Ollama{}, fmt.Errorf("read Ollama configuration: %w", err)
 	}
-	var o Ollama
-	inside := false
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
-		if line == "[ollama]" {
-			inside = true
-			continue
-		}
-		if strings.HasPrefix(line, "[") {
-			inside = false
-		}
-		if !inside || !strings.Contains(line, "=") {
-			continue
-		}
-		p := strings.SplitN(line, "=", 2)
-		switch strings.TrimSpace(p[0]) {
-		case "endpoint":
-			o.Endpoint = strings.Trim(strings.TrimSpace(p[1]), "\"")
-		case "model":
-			o.Model = strings.Trim(strings.TrimSpace(p[1]), "\"")
-		}
-	}
-	return o, nil
+	return Ollama{Endpoint: configured.OllamaEndpoint, Model: configured.OllamaModel}, nil
 }
 
 // Summarize generates a strictly structured local summary.
