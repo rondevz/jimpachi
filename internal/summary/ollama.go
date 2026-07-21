@@ -61,7 +61,7 @@ func (o Ollama) Summarize(ctx context.Context, transcript string) (Summary, erro
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"model": o.Model, "stream": false, "format": "json", "prompt": "Create JSON only with title, overview, agreements_decisions, action_items, deadlines, open_questions. Omit unavailable content as empty strings or arrays. Transcript:\n" + transcript})
+	body, _ := json.Marshal(map[string]any{"model": o.Model, "stream": false, "format": summarySchema(), "prompt": "Summarize the transcript according to the supplied JSON schema. Omit unavailable content as empty strings or arrays. Transcript:\n" + transcript})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(endpoint.String(), "/")+"/api/generate", bytes.NewReader(body))
 	if err != nil {
 		return Summary{}, fmt.Errorf("create Ollama request: %w", err)
@@ -94,6 +94,25 @@ func (o Ollama) Summarize(ctx context.Context, transcript string) (Summary, erro
 		return Summary{}, fmt.Errorf("read Ollama response: summary is required")
 	}
 	return parseJSON([]byte(response.Response))
+}
+
+func summarySchema() map[string]any {
+	stringArray := func() map[string]any {
+		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title":                map[string]any{"type": "string", "minLength": 1},
+			"overview":             map[string]any{"type": "string"},
+			"agreements_decisions": stringArray(),
+			"action_items":         stringArray(),
+			"deadlines":            stringArray(),
+			"open_questions":       stringArray(),
+		},
+		"required":             []string{"title", "overview", "agreements_decisions", "action_items", "deadlines", "open_questions"},
+		"additionalProperties": false,
+	}
 }
 
 func parseJSON(b []byte) (Summary, error) {

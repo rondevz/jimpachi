@@ -2,12 +2,66 @@ package summary
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestOllamaRequestsStringArraysWithJSONSchema(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Format struct {
+				Type       string   `json:"type"`
+				Required   []string `json:"required"`
+				Additional *bool    `json:"additionalProperties"`
+				Properties map[string]struct {
+					Type      string `json:"type"`
+					MinLength int    `json:"minLength"`
+					Items     struct {
+						Type string `json:"type"`
+					} `json:"items"`
+				} `json:"properties"`
+			} `json:"format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.Format.Type != "object" || len(request.Format.Properties) != 6 {
+			t.Errorf("format root = %#v, want object with six properties", request.Format)
+		}
+		if request.Format.Additional == nil || *request.Format.Additional {
+			t.Errorf("additionalProperties = %v, want false", request.Format.Additional)
+		}
+		required := make(map[string]bool, len(request.Format.Required))
+		for _, field := range request.Format.Required {
+			required[field] = true
+		}
+		for _, field := range []string{"title", "overview", "agreements_decisions", "action_items", "deadlines", "open_questions"} {
+			if !required[field] {
+				t.Errorf("required = %#v, missing %q", request.Format.Required, field)
+			}
+		}
+		if title, overview := request.Format.Properties["title"], request.Format.Properties["overview"]; title.Type != "string" || title.MinLength != 1 || overview.Type != "string" {
+			t.Errorf("title/overview schema = %#v, %#v", title, overview)
+		}
+		for _, field := range []string{"agreements_decisions", "action_items", "deadlines", "open_questions"} {
+			property := request.Format.Properties[field]
+			if property.Type != "array" || property.Items.Type != "string" {
+				t.Errorf("format property %q = %#v, want array of strings", field, property)
+			}
+		}
+		_, _ = w.Write([]byte(`{"response":"{\"title\":\"Plan\",\"overview\":\"\",\"agreements_decisions\":[],\"action_items\":[],\"deadlines\":[],\"open_questions\":[]}"}`))
+	}))
+	defer server.Close()
+	if _, err := (Ollama{Endpoint: server.URL, Model: "local"}).Summarize(context.Background(), "private transcript"); err != nil {
+		t.Fatalf("Summarize() error = %v", err)
+	}
+}
 
 func TestOllamaClassifiesInvalidEndpointAsConfigurationError(t *testing.T) {
 	for _, endpoint := range []string{"http://example.com", "://bad"} {
